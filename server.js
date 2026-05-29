@@ -17,6 +17,26 @@ const DOCS_FILE = process.env.DOCS_FILE || "/srv/docs/index.html";
 const PRICES_FILE = process.env.PRICES_FILE || "/srv/prices.json";
 const CANON = process.env.LOCAL_MODEL || "google/gemma-4-26b-a4b";
 
+// ── error → HyperDX (OTLP logs, service.name=llm.hostbun.cc). Auth header has NO "Bearer". ──
+const HDX_KEY = process.env.HYPERDX_INGEST_API_KEY || "";
+const HDX_URL = process.env.HYPERDX_OTLP_URL || "https://otel.hyperdx.hostbun.cc/v1/logs";
+function shipError(message, attrs) {
+  if (!HDX_KEY) return;
+  const payload = { resourceLogs: [{
+    resource: { attributes: [
+      { key: "service.name", value: { stringValue: "llm.hostbun.cc" } },
+      { key: "deployment.environment", value: { stringValue: "prod" } },
+    ] },
+    scopeLogs: [{ logRecords: [{
+      timeUnixNano: String(Date.now()) + "000000",
+      severityText: "ERROR", severityNumber: 17,
+      body: { stringValue: String(message).slice(0, 2000) },
+      attributes: Object.entries(attrs || {}).map(([k, v]) => ({ key: k, value: { stringValue: String(v).slice(0, 500) } })),
+    }] }],
+  }] };
+  fetch(HDX_URL, { method: "POST", headers: { "content-type": "application/json", authorization: HDX_KEY }, body: JSON.stringify(payload) }).catch(() => {});
+}
+
 // "local" is the headline selector; gemma/canonical kept for back-compat. Exact match
 // only, so cloud models that merely start with "gemma" aren't hijacked to the local box.
 const LOCAL_NAMES = new Set(["local", "gemma", CANON.toLowerCase()]);
@@ -44,8 +64,9 @@ function sendFile(res, path, type, cors) {
   });
 }
 
-async function proxy(req, res, base, { bodyBuf, injectKey, rewriteLocal } = {}) {
+async function proxy(req, res, base, { bodyBuf, injectKey, rewriteLocal, model, lane } = {}) {
   const target = base + req.url;
+  const ip = req.headers["cf-connecting-ip"] || String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.socket.remoteAddress || "?";
   const headers = {};
   for (const [k, v] of Object.entries(req.headers)) {
     if (!HOP_REQ.has(k.toLowerCase())) headers[k] = v;
@@ -63,8 +84,14 @@ async function proxy(req, res, base, { bodyBuf, injectKey, rewriteLocal } = {}) 
   let up;
   try { up = await fetch(target, init); }
   catch (e) {
+    console.error(`[err] fetch-failed lane=${lane || "?"} model=${model || "-"} ${target}: ${e.message}`);
+    shipError(`upstream fetch failed: ${e.message}`, { model: model || "-", lane: lane || "?", ip, target });
     res.writeHead(502, { "content-type": "application/json" });
     return res.end(JSON.stringify({ error: { message: "upstream fetch failed: " + e.message } }));
+  }
+  if (up.status >= 400) {
+    console.error(`[err] upstream=${up.status} lane=${lane || "?"} model=${model || "-"} ${target}`);
+    up.clone().text().then((t) => shipError(`upstream ${up.status} ${req.method} ${req.url}`, { model: model || "-", lane: lane || "?", ip, status: up.status, body: t })).catch(() => {});
   }
   const rh = {};
   up.headers.forEach((v, k) => { if (!HOP_RES.has(k.toLowerCase())) rh[k] = v; });
@@ -117,8 +144,8 @@ const server = http.createServer(async (req, res) => {
   const ip = req.headers["cf-connecting-ip"] || String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.socket.remoteAddress || "?";
   const lane = isLocalModel(model) ? "local" : "cloud";
   console.log(`[req] ${new Date().toISOString()} ip=${ip} ${req.method} ${path} model=${model || "-"} -> ${lane} ua="${String(req.headers["user-agent"] || "").slice(0, 50)}"`);
-  if (isLocalModel(model)) return proxy(req, res, LOCAL, { bodyBuf, injectKey: false, rewriteLocal: true });
-  return proxy(req, res, CRAZY, { bodyBuf, injectKey: true });
+  if (isLocalModel(model)) return proxy(req, res, LOCAL, { bodyBuf, injectKey: false, rewriteLocal: true, model, lane });
+  return proxy(req, res, CRAZY, { bodyBuf, injectKey: true, model, lane });
 });
 
 server.listen(PORT, () => console.log(`llm-hostbun-proxy on :${PORT} crazy=${CRAZY} local=${LOCAL} key=${KEY ? "set" : "MISSING"}`));
