@@ -1,8 +1,10 @@
 // llm.hostbun.cc — single-URL OpenAI router.
-//   model "gemma" / "local" / "google/gemma-4-26b-a4b"   -> local LM Studio gemma, no key
+//   model "local"                                        -> local LM Studio gemma-4-e4b-it-obliterated (DEFAULT, multimodal, open)
+//   model "gemma-4-e4b-it-obliterated"                   -> same (full id)
+//   model "gemma" / "google/gemma-4-26b-a4b"             -> local LM Studio gemma 26B MoE, no key
 //   model "obliterated" / "qwen3.6-27b-obliterated"      -> local LM Studio Qwen3.6-27B abliterated (Bearer-gated if OBLIT_TOKEN set)
 //   any other model                                      -> crazyrouter.com, key injected
-//   (local models JIT-swap in VRAM — both don't fit at once)
+//   (local models JIT-swap in VRAM — they don't all fit at once)
 //   GET /v1/models                            -> local gemma + crazyrouter's full list (merged)
 //   /docs, docs.<host>                         -> docs page
 //   /prices(.json)                             -> computed price feed (CORS *)
@@ -19,6 +21,8 @@ const DOCS_FILE = process.env.DOCS_FILE || "/srv/docs/index.html";
 const PRICES_FILE = process.env.PRICES_FILE || "/srv/prices.json";
 const CANON = process.env.LOCAL_MODEL || "google/gemma-4-26b-a4b";
 const OBLIT = process.env.LOCAL_MODEL_2 || "qwen3.6-27b-obliterated";
+// Default local model: small (8GB) multimodal abliterated Gemma 4 E4B. "local" resolves here.
+const E4B = process.env.LOCAL_MODEL_3 || "gemma-4-e4b-it-obliterated";
 // Optional bearer gate for the obliterated (uncensored) model only. When set, requests
 // routed to OBLIT must send `Authorization: Bearer <OBLIT_TOKEN>` (or `x-api-key`).
 // gemma + cloud lanes stay open so existing callers (fb-bot, promopilot) are unaffected.
@@ -44,12 +48,14 @@ function shipError(message, attrs) {
   fetch(HDX_URL, { method: "POST", headers: { "content-type": "application/json", authorization: HDX_KEY }, body: JSON.stringify(payload) }).catch(() => {});
 }
 
-// Alias (lowercased) -> the exact model id sent to LM Studio. "local"/"gemma" map to the
-// gemma MoE (back-compat); "obliterated" + the full id map to the Qwen3.6-27B abliterated
-// model. Exact match only, so cloud models that merely start with "gemma" aren't hijacked.
-// Both local models can't fit VRAM at once — LM Studio JIT-swaps between them on request.
+// Alias (lowercased) -> the exact model id sent to LM Studio. "local" (the default selector)
+// maps to the small multimodal E4B; "gemma" + the 26B full id stay on the gemma MoE
+// (back-compat for fb-bot/promopilot); "obliterated" + its full id map to the Qwen3.6-27B
+// abliterated model. Exact match only, so cloud models that merely start with "gemma" aren't
+// hijacked. The local models can't all fit VRAM at once — LM Studio JIT-swaps on request.
 const LOCAL_MAP = new Map([
-  ["local", CANON],
+  ["local", E4B],
+  [E4B.toLowerCase(), E4B],
   ["gemma", CANON],
   [CANON.toLowerCase(), CANON],
   ["obliterated", OBLIT],
@@ -123,6 +129,7 @@ async function mergedModels(res) {
     const j = await u.json();
     const local = [
       { id: "local", object: "model", owned_by: "local-lmstudio" },
+      { id: E4B, object: "model", owned_by: "local-lmstudio" },
       { id: CANON, object: "model", owned_by: "local-lmstudio" },
       { id: OBLIT, object: "model", owned_by: "local-lmstudio" },
     ];
