@@ -119,7 +119,7 @@ function mergeConfig(base, saved) {
       if (typeof k === "string" && typeof v === "string" && k.trim() && v.trim())
         m[k.trim().toLowerCase()] = v.trim();
     }
-    if (Object.keys(m).length) c.localMap = m;
+    c.localMap = m; // allow an explicit empty map to fully disable the local lane
   }
   if (Array.isArray(saved.gatedModels))
     c.gatedModels = saved.gatedModels.filter((x) => typeof x === "string" && x.trim()).map((x) => x.trim());
@@ -969,9 +969,11 @@ const server = http.createServer(async (req, res) => {
   // Flow policy blocked this model (cloud off / not allowlisted / unknown with no default route).
   if (route.blocked) {
     console.error(`[err] 400 blocked ip=${ip} model=${model || "-"} (${route.why})`);
-    recordCall({ ts: Date.now(), ip, ua: req.headers["user-agent"] || "", method: req.method, path,
-      reqModel: model || null, lane: "blocked", sentModel: null, keyLabel: "—", status: 400, ms: 0,
-      error: `not routable: ${route.why}`, reqContent: extractRequestContent(bodyBuf) });
+    // Only log real inference attempts as blocked — not scanner GETs to /openapi.json, /favicon, etc.
+    if (req.method === "POST" && bodyBuf.length)
+      recordCall({ ts: Date.now(), ip, ua: req.headers["user-agent"] || "", method: req.method, path,
+        reqModel: model || null, lane: "blocked", sentModel: null, keyLabel: "—", status: 400, ms: 0,
+        error: `not routable: ${route.why}`, reqContent: extractRequestContent(bodyBuf) });
     res.writeHead(400, { "content-type": "application/json" });
     return res.end(JSON.stringify({ error: { message: `model '${model || ""}' is not routable: ${route.why}. Set a model override, cloud allowlist entry, or default route in /admin.`, type: "invalid_request_error", code: "model_not_routable" } }));
   }
