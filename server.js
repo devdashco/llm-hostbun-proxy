@@ -620,11 +620,22 @@ async function upstreamCatalogs() {
     wrappy = ((cj && cj.data) || []).map((m) => ({ ...m, owned_by: "wrappy" }));
   } catch { /* wrappy down — skip */ }
   let crazyrouter = [];
+  const seen = new Set();
   try {
     const u = await fetch(CFG.bases.crazyrouter + "/v1/models", { headers: { authorization: `Bearer ${CFG.crazyrouterKey}` } });
     const j = await u.json();
-    crazyrouter = (j && j.data) || [];
-  } catch { /* crazyrouter down — skip */ }
+    for (const m of (j && j.data) || []) { if (m && m.id && !seen.has(m.id)) { seen.add(m.id); crazyrouter.push(m); } }
+  } catch { /* crazyrouter /v1/models down — fall back to the price feed below */ }
+  // crazyrouter.com/v1/models only lists a sliver of the catalog for some keys, while the price
+  // feed (gen-prices.sh → /api/pricing) carries the full ~250. Merge in any priced ids we don't
+  // already have so /v1/models reflects everything that's actually routable.
+  try {
+    const pj = JSON.parse(fs.readFileSync(PRICES_FILE, "utf8"));
+    for (const m of (pj && pj.models) || []) {
+      const id = m && m.model;
+      if (id && !seen.has(id)) { seen.add(id); crazyrouter.push({ id, object: "model", owned_by: "crazyrouter" }); }
+    }
+  } catch { /* no price feed yet — keep whatever the live catalog returned */ }
   return { wrappy, crazyrouter };
 }
 
