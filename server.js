@@ -79,6 +79,16 @@ function envDefaults() {
     wrappyToken: process.env.WRAPPY_TOKEN || process.env.CLAUDE_TOKEN || "ddash",
     // models starting with this prefix (lowercased) route to the wrappy lane.
     wrappyPrefix: process.env.WRAPPY_PREFIX || "claude",
+    // ── wrappy → crazyrouter failover ──
+    // When the wrappy lane (claudebox) errors or is unreachable, automatically retry the SAME
+    // request on the crazyrouter lane. crazyrouter exposes the identical claude-* ids, so by
+    // default we resend the caller's model unchanged (model: "" = pass-through). Set model to a
+    // specific crazyrouter id to pin the fallback. Triggers on: fetch failure, HTTP >=500, 429,
+    // 401, 403 (token died). One shot per request — never loops.
+    wrappyFallback: {
+      enabled: (process.env.WRAPPY_FALLBACK || "1") !== "0",
+      model: process.env.WRAPPY_FALLBACK_MODEL || "",
+    },
     // Bearer gate for the uncensored model(s). When oblitToken is set, requests routed to a model
     // id listed in gatedModels require Authorization: Bearer <oblitToken> (or x-api-key). Empty
     // token = open. gemma + crazyrouter stay open so fb-bot/promopilot are unaffected.
@@ -168,6 +178,13 @@ function mergeConfig(base, saved) {
     c.forceModel = {
       enabled: !!f.enabled,
       lane: normLane(f.lane) || "wrappy",
+      model: typeof f.model === "string" ? f.model.trim() : "",
+    };
+  }
+  if (saved.wrappyFallback && typeof saved.wrappyFallback === "object") {
+    const f = saved.wrappyFallback;
+    c.wrappyFallback = {
+      enabled: !!f.enabled,
       model: typeof f.model === "string" ? f.model.trim() : "",
     };
   }
@@ -359,6 +376,20 @@ const localTarget = (m) => (m == null ? null : CFG.localMap[String(m).toLowerCas
 const isWrappyModel = (m) => typeof m === "string" && m.toLowerCase().startsWith((CFG.wrappyPrefix || "claude").toLowerCase());
 const isGated = (target) => Array.isArray(CFG.gatedModels) && CFG.gatedModels.includes(target);
 
+// ── wrappy → crazyrouter failover ──
+// True when a wrappy upstream result should trigger fallback (transport dead or server-side fail).
+const isWrappyFailure = (status, threw) => threw || status >= 500 || status === 429 || status === 401 || status === 403;
+// Build the crazyrouter route to retry a failed wrappy call on. `model` = caller's original model.
+// Returns null when fallback is disabled or no usable model. crazyrouter mirrors the claude-* ids,
+// so an empty configured model means "resend the caller's model unchanged".
+function wrappyFallbackRoute(model) {
+  const fb = CFG.wrappyFallback;
+  if (!fb || !fb.enabled) return null;
+  const fbModel = (fb.model && fb.model.trim()) || (model == null ? "" : String(model));
+  if (!fbModel) return null;
+  return { lane: "crazyrouter", base: CFG.bases.crazyrouter, injectKey: true, rewriteModel: fbModel, reason: "wrappy fallback -> crazyrouter" };
+}
+
 const HOP_REQ = new Set(["host", "connection", "content-length", "accept-encoding",
   "keep-alive", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"]);
 const HOP_RES = new Set(["connection", "content-length", "content-encoding",
@@ -413,20 +444,46 @@ async function proxy(req, res, base, opts = {}) {
     keyLabel: keyLabel({ lane: lane || "local", target: opts.target }), stream,
     reqContent: extractRequestContent(bodyBuf),
   };
-  const init = { method: req.method, headers, redirect: "follow" };
-  if (!["GET", "HEAD"].includes(req.method) && body && body.length) init.body = body;
-  let up;
-  try { up = await fetch(target, init); }
-  catch (e) {
-    console.error(`[err] fetch-failed lane=${lane || "?"} model=${model || "-"} ${target}: ${e.message}`);
-    shipError(`upstream fetch failed: ${e.message}`, { model: model || "-", lane: lane || "?", ip, target });
-    recordCall({ ...base_rec, status: 502, ms: Date.now() - t0, error: "upstream fetch failed: " + e.message });
+  let curTarget = target, curLane = lane;
+  let curInit = { method: req.method, headers, redirect: "follow" };
+  if (!["GET", "HEAD"].includes(req.method) && body && body.length) curInit.body = body;
+  let up = null, threw = false, fetchErr = null;
+  try { up = await fetch(curTarget, curInit); }
+  catch (e) { threw = true; fetchErr = e; }
+
+  // wrappy → crazyrouter failover (one shot). Decided before any client bytes are sent, so it is
+  // safe even for streaming responses — nothing has been written to `res` yet.
+  if (lane === "wrappy" && isWrappyFailure(up ? up.status : 0, threw)) {
+    const fb = wrappyFallbackRoute(model);
+    if (fb) {
+      const why = threw ? `fetch-failed (${fetchErr.message})` : `status ${up.status}`;
+      console.warn(`[fallback] wrappy ${why} -> crazyrouter model=${fb.rewriteModel} ${target}`);
+      shipError(`wrappy fallback -> crazyrouter`, { from: "wrappy", reason: why, model: model || "-", fbModel: fb.rewriteModel, ip });
+      const fbHeaders = buildHeaders(req, { injectKey: true });
+      let fbBody = bodyBuf;
+      if (bodyBuf && bodyBuf.length) {
+        try { const j = JSON.parse(bodyBuf.toString()); j.model = fb.rewriteModel; fbBody = Buffer.from(JSON.stringify(j)); fbHeaders["content-type"] = "application/json"; } catch { /* leave body as-is */ }
+      }
+      curTarget = fb.base + req.url; curLane = "crazyrouter";
+      base_rec.lane = "crazyrouter"; base_rec.sentModel = fb.rewriteModel; base_rec.keyLabel = "crazyrouterKey";
+      curInit = { method: req.method, headers: fbHeaders, redirect: "follow" };
+      if (!["GET", "HEAD"].includes(req.method) && fbBody && fbBody.length) curInit.body = fbBody;
+      up = null; threw = false; fetchErr = null;
+      try { up = await fetch(curTarget, curInit); }
+      catch (e) { threw = true; fetchErr = e; }
+    }
+  }
+
+  if (threw) {
+    console.error(`[err] fetch-failed lane=${curLane || "?"} model=${model || "-"} ${curTarget}: ${fetchErr.message}`);
+    shipError(`upstream fetch failed: ${fetchErr.message}`, { model: model || "-", lane: curLane || "?", ip, target: curTarget });
+    recordCall({ ...base_rec, status: 502, ms: Date.now() - t0, error: "upstream fetch failed: " + fetchErr.message });
     res.writeHead(502, { "content-type": "application/json" });
-    return res.end(JSON.stringify({ error: { message: "upstream fetch failed: " + e.message } }));
+    return res.end(JSON.stringify({ error: { message: "upstream fetch failed: " + fetchErr.message } }));
   }
   if (up.status >= 400) {
-    console.error(`[err] upstream=${up.status} lane=${lane || "?"} model=${model || "-"} ${target}`);
-    up.clone().text().then((t) => shipError(`upstream ${up.status} ${req.method} ${req.url}`, { model: model || "-", lane: lane || "?", ip, status: up.status, body: t })).catch(() => {});
+    console.error(`[err] upstream=${up.status} lane=${curLane || "?"} model=${model || "-"} ${curTarget}`);
+    up.clone().text().then((t) => shipError(`upstream ${up.status} ${req.method} ${req.url}`, { model: model || "-", lane: curLane || "?", ip, status: up.status, body: t })).catch(() => {});
   }
   const rh = {};
   up.headers.forEach((v, k) => { if (!HOP_RES.has(k.toLowerCase())) rh[k] = v; });
@@ -540,10 +597,30 @@ async function jsonEnforce(req, res, route) {
     delete reqObj.response_format;
     injectJsonInstruction(messages, rf);
   }
-  const headers = buildHeaders(req, { injectKey, authToken });
+  let headers = buildHeaders(req, { injectKey, authToken });
   headers["content-type"] = "application/json";
   headers["accept"] = "application/json";
-  const target = base + req.url;
+  let target = base + req.url;
+
+  // wrappy → crazyrouter failover: re-point this enforced call at crazyrouter once. The messages
+  // were already steered with a JSON instruction (wrappy path strips response_format above), so the
+  // crazyrouter model still returns JSON we can validate. One shot, guarded by `fellBack`.
+  let curLane = lane, fellBack = false;
+  function switchWrappyToCrazy() {
+    const fb = wrappyFallbackRoute(model);
+    if (!fb) return false;
+    curLane = "crazyrouter";
+    target = fb.base + req.url;
+    headers = buildHeaders(req, { injectKey: true });
+    headers["content-type"] = "application/json";
+    headers["accept"] = "application/json";
+    reqObj.model = fb.rewriteModel;
+    logRec.lane = "crazyrouter"; logRec.sentModel = fb.rewriteModel; logRec.keyLabel = "crazyrouterKey";
+    fellBack = true;
+    console.warn(`[fallback] wrappy(json-enforce) -> crazyrouter model=${fb.rewriteModel}`);
+    shipError(`wrappy fallback -> crazyrouter (json-enforce)`, { from: "wrappy", model: model || "-", fbModel: fb.rewriteModel, ip });
+    return true;
+  }
 
   let lastErr = "", lastRaw = "";
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -551,16 +628,20 @@ async function jsonEnforce(req, res, route) {
     let up;
     try { up = await fetch(target, { method: req.method, headers, redirect: "follow", body: Buffer.from(JSON.stringify(reqObj)) }); }
     catch (e) {
-      console.error(`[err] json-enforce fetch-failed lane=${lane} model=${model || "-"} ${target}: ${e.message}`);
-      shipError(`json-enforce upstream fetch failed: ${e.message}`, { model: model || "-", lane, ip, target });
+      // wrappy unreachable → fall back to crazyrouter and retry this attempt.
+      if (curLane === "wrappy" && !fellBack && switchWrappyToCrazy()) { attempt--; continue; }
+      console.error(`[err] json-enforce fetch-failed lane=${curLane} model=${model || "-"} ${target}: ${e.message}`);
+      shipError(`json-enforce upstream fetch failed: ${e.message}`, { model: model || "-", lane: curLane, ip, target });
       recordCall({ ...logRec, status: 502, ms: Date.now() - t0, error: "upstream fetch failed: " + e.message });
       res.writeHead(502, { "content-type": "application/json" });
       return res.end(JSON.stringify({ error: { message: "upstream fetch failed: " + e.message } }));
     }
     const text = await up.text();
-    if (up.status >= 400) {                                // upstream error — surface it, don't retry
-      console.error(`[err] upstream=${up.status} lane=${lane} model=${model || "-"} ${target} (json-enforce)`);
-      shipError(`upstream ${up.status} ${req.method} ${req.url} (json-enforce)`, { model: model || "-", lane, ip, status: up.status, body: text });
+    if (up.status >= 400) {                                // upstream error
+      // wrappy server-side failure → fall back to crazyrouter and retry this attempt.
+      if (curLane === "wrappy" && !fellBack && isWrappyFailure(up.status, false) && switchWrappyToCrazy()) { attempt--; continue; }
+      console.error(`[err] upstream=${up.status} lane=${curLane} model=${model || "-"} ${target} (json-enforce)`);
+      shipError(`upstream ${up.status} ${req.method} ${req.url} (json-enforce)`, { model: model || "-", lane: curLane, ip, status: up.status, body: text });
       recordCall({ ...logRec, status: up.status, ms: Date.now() - t0, error: `upstream ${up.status}`, respContent: text });
       const rh = {}; up.headers.forEach((v, k) => { if (!HOP_RES.has(k.toLowerCase())) rh[k] = v; });
       res.writeHead(up.status, rh);
@@ -739,6 +820,7 @@ function adminState() {
     localMap: CFG.localMap,
     gatedModels: CFG.gatedModels,
     wrappyPrefix: CFG.wrappyPrefix,
+    wrappyFallback: CFG.wrappyFallback,
     forceModel: CFG.forceModel,
     modelRoutes: CFG.modelRoutes,
     cloudPolicy: CFG.cloudPolicy,
@@ -857,6 +939,7 @@ async function handleAdminApi(req, res, path) {
     if (patch.localMap) next.localMap = patch.localMap;
     if (patch.gatedModels) next.gatedModels = patch.gatedModels;
     if (typeof (patch.wrappyPrefix ?? patch.claudePrefix) === "string") next.wrappyPrefix = patch.wrappyPrefix ?? patch.claudePrefix;
+    if (patch.wrappyFallback && typeof patch.wrappyFallback === "object") next.wrappyFallback = patch.wrappyFallback;
     if (patch.forceModel) next.forceModel = patch.forceModel;
     if (patch.modelRoutes) next.modelRoutes = patch.modelRoutes;
     if (patch.cloudPolicy) next.cloudPolicy = patch.cloudPolicy;

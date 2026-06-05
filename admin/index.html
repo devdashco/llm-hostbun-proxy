@@ -141,6 +141,15 @@ small.hint{color:var(--mut);font-size:12px}
     </div>
 
     <div class="card">
+      <h3>🛟 Wrappy failover <small class="hint">— if claudebox (wrappy) dies, auto-retry on crazyrouter</small></h3>
+      <div class="row">
+        <label class="flex" style="flex:0 0 auto"><input type="checkbox" id="wfEnabled" style="width:auto;margin-right:8px"/> fallback enabled</label>
+        <input id="wfModel" list="modellist" placeholder="crazyrouter model (blank = resend caller's model)" style="flex:2"/>
+      </div>
+      <small class="hint">Triggers on wrappy fetch-failure / HTTP ≥500 / 429 / 401 / 403. crazyrouter mirrors the <code>claude-*</code> ids, so leaving the model blank just resends the same model on the crazyrouter key. One retry per request.</small>
+    </div>
+
+    <div class="card">
       <h3>🔎 Resolve / trace <small class="hint">— see where a model goes, without calling it</small></h3>
       <div class="row">
         <input id="resolveIn" list="modellist" placeholder="model name e.g. deepseek-v3" style="flex:2"/>
@@ -328,6 +337,7 @@ function renderState(s){
   $('kid-e4b').textContent=s.knownLocalIds.e4b; $('kid-gemma').textContent=s.knownLocalIds.gemma; $('kid-obl').textContent=s.knownLocalIds.obliterated;
   // flow control
   const fm=s.forceModel||{}; $('forceEnabled').checked=!!fm.enabled; $('forceLane').value=fm.lane||'wrappy'; $('forceModel').value=fm.model||'';
+  const wf=s.wrappyFallback||{}; $('wfEnabled').checked=!!wf.enabled; $('wfModel').value=wf.model||'';
   document.querySelectorAll('input[name=cp]').forEach(r=>r.checked=(r.value===(s.cloudPolicy||'open')));
   $('cloudAllowlist').value=(s.cloudAllowlist||[]).join(', ');
   const dr=s.defaultRoute||{}; $('drLane').value=dr.lane||'none'; $('drModel').value=dr.model||'';
@@ -391,6 +401,7 @@ async function saveRouting(){
     localMap:S.localMap,
     modelRoutes:S.modelRoutes,
     forceModel:{enabled:$('forceEnabled').checked,lane:$('forceLane').value,model:$('forceModel').value.trim()},
+    wrappyFallback:{enabled:$('wfEnabled').checked,model:$('wfModel').value.trim()},
     cloudPolicy:cp,
     cloudAllowlist:$('cloudAllowlist').value.split(',').map(x=>x.trim()).filter(Boolean),
     defaultRoute:{lane:$('drLane').value,model:$('drModel').value.trim()},
@@ -440,6 +451,7 @@ async function loadHealth(){
   $('ovgrid').innerHTML=
     kv('Lanes up',up+' / 3')+
     kv('Force model',fm.enabled?`<span class="warnp">${esc(fm.lane)}/${esc(fm.model)}</span>`:'off')+
+    kv('Wrappy failover',(S.wrappyFallback&&S.wrappyFallback.enabled)?`→ crazyrouter${S.wrappyFallback.model?' ('+esc(S.wrappyFallback.model)+')':''}`:'off')+
     kv('Cloud policy',S.cloudPolicy||'open')+
     kv('Overrides',Object.keys(S.modelRoutes||{}).length)+
     kv('JSON enforce',S.jsonEnforce?'ON':'OFF')+
