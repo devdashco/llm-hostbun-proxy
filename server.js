@@ -125,7 +125,7 @@ function envDefaults() {
     // Project attribution. When requireProject is on, inference calls must declare a project via the
     // X-Project header (or body project/metadata.project/user) or they're rejected 400. Off = the
     // project is still recorded when supplied, just not mandatory.
-    requireProject: (process.env.REQUIRE_PROJECT || "0") === "1",
+    requireProject: (process.env.REQUIRE_PROJECT || "1") === "1",
     // Admin password (HMAC secret + login check). Weak default per request — rotate via the UI.
     adminPassword: process.env.ADMIN_PASSWORD || "ddash",
     // Call logging → SQLite at CALLS_DB. enabled: record any call metadata at all;
@@ -414,6 +414,28 @@ function isClaudeboxNotice(content) {
          /\bresets?\b.*\bUTC\b/i.test(s) ||
          /(usage|rate|weekly|session) limit (reached|exceeded)/i.test(s);
 }
+// ── wrappy circuit breaker ──
+// After consecutive quota/error hits we skip wrappy entirely for CIRCUIT_TTL_MS to avoid paying
+// 12-27 seconds per call just to get a quota notice back. Resets automatically on TTL expiry.
+const CIRCUIT_TTL_MS = 20 * 60 * 1000;   // stay open 20 min — covers the time until the hourly reset
+const CIRCUIT_THRESHOLD = 3;              // consecutive failures before opening
+const wrappyCircuit = { failures: 0, openUntil: 0 };
+function wrappyCircuitOpen() { return Date.now() < wrappyCircuit.openUntil; }
+function wrappyCircuitTrip() {
+  wrappyCircuit.failures++;
+  if (wrappyCircuit.failures >= CIRCUIT_THRESHOLD && !wrappyCircuitOpen()) {
+    wrappyCircuit.openUntil = Date.now() + CIRCUIT_TTL_MS;
+    const resetAt = new Date(wrappyCircuit.openUntil).toISOString();
+    console.warn(`[circuit] wrappy circuit OPEN (${wrappyCircuit.failures} failures) — bypassing wrappy until ${resetAt}`);
+  }
+}
+function wrappyCircuitReset() {
+  if (wrappyCircuit.failures > 0) {
+    console.log("[circuit] wrappy circuit CLOSED — upstream healthy again");
+    wrappyCircuit.failures = 0; wrappyCircuit.openUntil = 0;
+  }
+}
+
 // Build the crazyrouter route to retry a failed wrappy call on. `model` = caller's original model.
 // Returns null when fallback is disabled or no usable model. crazyrouter mirrors the claude-* ids,
 // so an empty configured model means "resend the caller's model unchanged".
@@ -513,6 +535,7 @@ async function proxy(req, res, base, opts = {}) {
   }
 
   if (lane === "wrappy" && isWrappyFailure(up ? up.status : 0, threw)) {
+    wrappyCircuitTrip();
     await doFailover(threw ? `fetch-failed (${fetchErr.message})` : `status ${up.status}`);
   }
 
@@ -525,7 +548,10 @@ async function proxy(req, res, base, opts = {}) {
     preBuf = Buffer.from(await up.arrayBuffer());
     if (isClaudeboxNotice(extractResponseBody(preBuf, false).content)) {
       preBuf = null;
+      wrappyCircuitTrip();
       await doFailover("quota notice (200 body)");
+    } else {
+      wrappyCircuitReset(); // wrappy returned a real response — it's healthy
     }
   }
 
@@ -680,6 +706,7 @@ async function jsonEnforce(req, res, route) {
     reqObj.model = fb.rewriteModel;
     logRec.lane = "crazyrouter"; logRec.sentModel = fb.rewriteModel; logRec.keyLabel = "crazyrouterKey";
     fellBack = true;
+    wrappyCircuitTrip();
     console.warn(`[fallback] wrappy(json-enforce) -> crazyrouter model=${fb.rewriteModel}`);
     shipError(`wrappy fallback -> crazyrouter (json-enforce)`, { from: "wrappy", model: model || "-", fbModel: fb.rewriteModel, ip });
     return true;
@@ -702,7 +729,7 @@ async function jsonEnforce(req, res, route) {
     const text = await up.text();
     if (up.status >= 400) {                                // upstream error
       // wrappy server-side failure → fall back to crazyrouter and retry this attempt.
-      if (curLane === "wrappy" && !fellBack && isWrappyFailure(up.status, false) && switchWrappyToCrazy()) { attempt--; continue; }
+      if (curLane === "wrappy" && !fellBack && isWrappyFailure(up.status, false)) { wrappyCircuitTrip(); if (switchWrappyToCrazy()) { attempt--; continue; } }
       console.error(`[err] upstream=${up.status} lane=${curLane} model=${model || "-"} ${target} (json-enforce)`);
       shipError(`upstream ${up.status} ${req.method} ${req.url} (json-enforce)`, { model: model || "-", lane: curLane, ip, status: up.status, body: text });
       recordCall({ ...logRec, status: up.status, ms: Date.now() - t0, error: `upstream ${up.status}`, respContent: text });
@@ -720,9 +747,10 @@ async function jsonEnforce(req, res, route) {
     const content = msg && typeof msg.content === "string" ? msg.content : null;
     // claudebox quota notice leaked as a 200 → wrappy is effectively down. Fail over to crazyrouter
     // (one shot) instead of burning JSON retries against a model that will never answer.
-    if (curLane === "wrappy" && !fellBack && isClaudeboxNotice(content) && switchWrappyToCrazy()) { attempt--; continue; }
+    if (curLane === "wrappy" && !fellBack && isClaudeboxNotice(content)) { wrappyCircuitTrip(); if (switchWrappyToCrazy()) { attempt--; continue; } }
     const v = validateJsonContent(content);
     if (v.ok) {
+      if (curLane !== "crazyrouter") wrappyCircuitReset(); // healthy wrappy response
       if (v.repaired) { msg.content = v.value; logJson(up.status, parsed, null); return finishJson(res, wantStream, parsed, JSON.stringify(parsed)); }
       logJson(up.status, parsed, null);
       return finishJson(res, wantStream, parsed, text);
@@ -823,7 +851,14 @@ function resolveRoute(model) {
     return laneRoute(CFG.modelRoutes[key].lane, CFG.modelRoutes[key].model || m, `override: ${key}`);
   const lt = localTarget(m);
   if (lt) return { lane: "local", base: CFG.bases.local, rewriteModel: lt, target: lt, reason: "local alias" };
-  if (isWrappyModel(m)) return { lane: "wrappy", base: CFG.bases.wrappy, authToken: CFG.wrappyToken, reason: "wrappy prefix" };
+  if (isWrappyModel(m)) {
+    if (wrappyCircuitOpen()) {
+      // Circuit is open — route directly to the fallback without touching wrappy.
+      const fb = wrappyFallbackRoute(m);
+      if (fb) return { ...fb, reason: "wrappy circuit open → crazyrouter" };
+    }
+    return { lane: "wrappy", base: CFG.bases.wrappy, authToken: CFG.wrappyToken, reason: "wrappy prefix" };
+  }
   if (!m) return defaultRouteResolved("no model specified");
   const pol = CFG.cloudPolicy || "open";
   if (pol === "open") return { lane: "crazyrouter", base: CFG.bases.crazyrouter, injectKey: true, reason: "crazyrouter (open)" };
