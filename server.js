@@ -1248,6 +1248,10 @@ const server = http.createServer(async (req, res) => {
     const imgBody = await readBody(req);
     return proxy(req, res, CFG.bases.images, { bodyBuf: imgBody, lane: "images", authToken: CFG.imageToken, project: extractProject(req, imgBody) });
   }
+  // Image-service catalog endpoints (templates + LoRAs) — proxy GETs straight through.
+  if (req.method === "GET" && (path === "/v1/templates" || path === "/v1/loras")) {
+    return proxy(req, res, CFG.bases.images, { bodyBuf: Buffer.alloc(0), lane: "images", authToken: CFG.imageToken });
+  }
 
   const bodyBuf = ["GET", "HEAD"].includes(req.method) ? Buffer.alloc(0) : await readBody(req);
   let model = null;
