@@ -13,7 +13,7 @@ inference because of the compressor.
 import os
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from headroom import compress, CompressConfig
@@ -25,6 +25,9 @@ DEFAULT_MODEL = os.environ.get("HR_MODEL", "claude-sonnet-4-5-20250929")
 COMPRESS_USER = os.environ.get("HR_COMPRESS_USER", "0").lower() in ("1", "true", "yes")
 PROTECT_RECENT = int(os.environ.get("HR_PROTECT_RECENT", "4"))
 MIN_TOKENS = int(os.environ.get("HR_MIN_TOKENS", "250"))
+# Shared-secret gate. When set, /compress requires `Authorization: Bearer <token>`.
+# Empty = open (use only on a private network). /health is always open.
+AUTH_TOKEN = os.environ.get("HR_AUTH_TOKEN", "")
 
 
 class CompressIn(BaseModel):
@@ -42,7 +45,9 @@ def health():
 
 
 @app.post("/compress")
-def do_compress(req: CompressIn):
+def do_compress(req: CompressIn, authorization: str = Header(default="")):
+    if AUTH_TOKEN and authorization != f"Bearer {AUTH_TOKEN}":
+        raise HTTPException(status_code=401, detail="unauthorized")
     cfg = CompressConfig(
         compress_user_messages=COMPRESS_USER if req.compress_user_messages is None else req.compress_user_messages,
         protect_recent=PROTECT_RECENT if req.protect_recent is None else req.protect_recent,

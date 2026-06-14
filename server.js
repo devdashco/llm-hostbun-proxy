@@ -56,6 +56,7 @@ const HDX_URL = process.env.HYPERDX_OTLP_URL || "https://otel.hyperdx.hostbun.cc
 // set. Every call fast-fails to the original body (timeout / non-200 / parse error) so the
 // compressor can never block or break inference. ──
 const HEADROOM_URL = (process.env.HEADROOM_URL || "").replace(/\/$/, "");
+const HEADROOM_TOKEN = process.env.HEADROOM_TOKEN || ""; // bearer for the compress sidecar (if gated)
 const HEADROOM_TIMEOUT_MS = parseInt(process.env.HEADROOM_TIMEOUT_MS || "4000", 10);
 const HEADROOM_MIN_CHARS = parseInt(process.env.HEADROOM_MIN_CHARS || "2000", 10); // skip small bodies
 const HEADROOM_LANES = new Set(
@@ -545,9 +546,11 @@ async function headroomCompress(bodyBuf, model, lane) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), HEADROOM_TIMEOUT_MS);
   try {
+    const hdrs = { "content-type": "application/json" };
+    if (HEADROOM_TOKEN) hdrs["authorization"] = `Bearer ${HEADROOM_TOKEN}`;
     const r = await fetch(HEADROOM_URL + "/compress", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: hdrs,
       body: JSON.stringify({ messages: obj.messages, model: model || obj.model || undefined }),
       signal: ctrl.signal,
     });
