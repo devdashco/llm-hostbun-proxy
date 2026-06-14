@@ -534,6 +534,20 @@ function buildHeaders(req, { injectKey, authToken } = {}) {
   return headers;
 }
 
+// True if any message carries image (multimodal) content. OpenAI/Anthropic put images in an array
+// `content` as parts like {type:"image_url"...} / {type:"image", source} / {type:"input_image"}.
+function hasImageContent(messages) {
+  for (const m of messages) {
+    const c = m && m.content;
+    if (!Array.isArray(c)) continue;
+    for (const p of c) {
+      if (p && typeof p === "object" &&
+          (String(p.type || "").includes("image") || p.image_url || p.image || p.source)) return true;
+    }
+  }
+  return false;
+}
+
 // Run the request's `messages` through the headroom-compress sidecar before forwarding upstream.
 // Returns { buf, stats }. On ANY problem it returns the original bytes and stats=null, so a slow or
 // dead compressor never blocks inference. Only touches chat/messages bodies that carry a messages[].
@@ -543,6 +557,9 @@ async function headroomCompress(bodyBuf, model, lane) {
   let obj;
   try { obj = JSON.parse(bodyBuf.toString()); } catch { return { buf: bodyBuf, stats: null }; }
   if (!Array.isArray(obj.messages) || !obj.messages.length) return { buf: bodyBuf, stats: null };
+  // Skip multimodal/image requests: headroom can't shrink base64 (0 savings) and shipping a multi-MB
+  // image to the sidecar and back just adds latency + bandwidth. The image passes through untouched.
+  if (hasImageContent(obj.messages)) return { buf: bodyBuf, stats: null };
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), HEADROOM_TIMEOUT_MS);
   try {
