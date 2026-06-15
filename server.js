@@ -109,28 +109,37 @@ function envDefaults() {
     // token = open. gemma + crazyrouter stay open so fb-bot/promopilot are unaffected.
     oblitToken: process.env.OBLIT_TOKEN || "",
     gatedModels: [OBLIT],
-    // alias (lowercased) -> exact model id sent to LM Studio.
-    localMap: {
-      "local": E4B,
-      [E4B.toLowerCase()]: E4B,
-      "gemma": CANON,
-      [CANON.toLowerCase()]: CANON,
-      "obliterated": OBLIT,
-      "obliteratus": OBLIT,
-      [OBLIT.toLowerCase()]: OBLIT,
-    },
+    // LOCAL LANE RETIRED. The LM Studio backend (llm.bofrid.dev) is gone; the local lane is no
+    // longer used. An empty localMap means no model id ever resolves to the local lane. The legacy
+    // local ids ("local"/"gemma"/"obliterated"/...) are redirected to wrappy via modelRoutes below,
+    // so old callers keep working (and get a real, multimodal Claude model).
+    localMap: {},
     // ── flow control (admin-editable) ──
     // forceModel: when enabled, EVERY request is rewritten to this lane+model regardless of what
     // the caller asked for. The big red switch.
     forceModel: { enabled: false, lane: "wrappy", model: "" },
     // modelRoutes: explicit per-incoming-model overrides to ANY lane (highest priority after
     // forceModel). key = incoming model name (lowercased). value = { lane, model }.
-    modelRoutes: {},
+    // The legacy local model ids are redirected here to wrappy (claude-sonnet-4-6 is multimodal),
+    // so requests that still ask for "local"/"gemma"/"obliterated" — including image analysis —
+    // are served by Claude instead of the retired LM Studio backend.
+    modelRoutes: Object.fromEntries(
+      ["local", "gemma", "gemma-4-e4b-it-obliterated", "google/gemma-4-26b-a4b",
+       "obliterated", "obliteratus", "qwen3.6-27b-obliterated"]
+        .map((id) => [id, { lane: "wrappy", model: "claude-sonnet-4-6" }])
+    ),
     // projectRoutes: per-PROJECT overrides to ANY lane (highest priority of all — beats forceModel
     // and modelRoutes). Lets you steer a single app (e.g. promopilot) off gemini onto wrappy without
     // touching anyone else. key = project name (lowercased). value = { lane, model } (model "" = keep
-    // the caller's model id, just switch lane).
+    // the caller's model id, just switch lane) — OR { block: true } to reject every call from that
+    // project so it consumes zero tokens.
     projectRoutes: {},
+    // projectGroups: bundle many projects (e.g. all seoul:* lanes) under one rule. Each entry is
+    // { name, prefixes:[...], lane?, model?, block? }. A project matches when its slug equals or
+    // starts with any prefix (so "seoul:" catches seoul:probe, seoul:l1_metadata, …). block:true
+    // rejects all matching calls (zero tokens); otherwise lane/model reroute them. An exact
+    // projectRoutes entry always wins over a group (lets you exempt one project from a group block).
+    projectGroups: [],
     // cloudPolicy governs models that fall through to the crazyrouter lane:
     //   "open"      → forward anything (legacy behaviour)
     //   "allowlist" → only ids in cloudAllowlist reach crazyrouter; everything else → defaultRoute
@@ -225,11 +234,30 @@ function mergeConfig(base, saved) {
   if (saved.projectRoutes && typeof saved.projectRoutes === "object" && !Array.isArray(saved.projectRoutes)) {
     const pr = {};
     for (const [k, v] of Object.entries(saved.projectRoutes)) {
-      const lane = v && typeof v === "object" ? normLane(v.lane) : "";
-      if (typeof k === "string" && k.trim() && lane)
-        pr[k.trim().toLowerCase()] = { lane, model: typeof v.model === "string" ? v.model.trim() : "" };
+      if (typeof k !== "string" || !k.trim() || !v || typeof v !== "object") continue;
+      if (v.block) { pr[k.trim().toLowerCase()] = { block: true }; continue; }
+      const lane = normLane(v.lane);
+      if (lane) pr[k.trim().toLowerCase()] = { lane, model: typeof v.model === "string" ? v.model.trim() : "" };
     }
     c.projectRoutes = pr;
+  }
+  if (Array.isArray(saved.projectGroups)) {
+    const pg = [];
+    const seen = new Set();
+    for (const g of saved.projectGroups) {
+      if (!g || typeof g !== "object") continue;
+      const name = typeof g.name === "string" ? g.name.trim() : "";
+      const prefixes = Array.isArray(g.prefixes)
+        ? [...new Set(g.prefixes.filter((x) => typeof x === "string" && x.trim()).map((x) => x.trim().toLowerCase()))]
+        : [];
+      const nkey = name.toLowerCase();
+      if (!name || !prefixes.length || seen.has(nkey)) continue;
+      seen.add(nkey);
+      if (g.block) { pg.push({ name, prefixes, block: true }); continue; }
+      const lane = normLane(g.lane);
+      if (lane) pg.push({ name, prefixes, lane, model: typeof g.model === "string" ? g.model.trim() : "" });
+    }
+    c.projectGroups = pg;
   }
   if (["open", "allowlist", "off"].includes(saved.cloudPolicy)) c.cloudPolicy = saved.cloudPolicy;
   if (Array.isArray(saved.cloudAllowlist))
@@ -478,7 +506,7 @@ async function probeWrappy() {
     const r = await fetch(CFG.bases.wrappy + "/v1/chat/completions", {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${CFG.wrappyToken}` },
-      body: JSON.stringify({ model: "claude-haiku-4-5", messages: [{ role: "user", content: "ping" }], max_tokens: 1, stream: false }),
+      body: JSON.stringify({ model: "claude-haiku-4-5", messages: [{ role: "user", content: "reply ok" }], max_tokens: WRAPPY_MIN_MAX_TOKENS, stream: false }),
       signal: AbortSignal.timeout(30000),
     });
     if (!r.ok) return;                                   // still erroring — stay open
@@ -548,6 +576,18 @@ function hasImageContent(messages) {
   return false;
 }
 
+// claudebox maps `max_tokens` → `max_thinking_tokens`; a tiny budget (e.g. 1) starves the agent so
+// it never emits a final answer and the request hangs until timeout. That hang counts as a wrappy
+// failure → trips the circuit / fails over to crazyrouter. Floor wrappy-bound requests (and our own
+// probes) so small-max_tokens callers can't wedge the lane. Only raises when an explicit value is
+// below the floor; unset is left alone (claudebox uses its own working default).
+const WRAPPY_MIN_MAX_TOKENS = Number(process.env.WRAPPY_MIN_MAX_TOKENS || 1024);
+function floorWrappyTokens(obj) {
+  if (obj && typeof obj.max_tokens === "number" && obj.max_tokens < WRAPPY_MIN_MAX_TOKENS)
+    obj.max_tokens = WRAPPY_MIN_MAX_TOKENS;
+  return obj;
+}
+
 // Run the request's `messages` through the headroom-compress sidecar before forwarding upstream.
 // Returns { buf, stats }. On ANY problem it returns the original bytes and stats=null, so a slow or
 // dead compressor never blocks inference. Only touches chat/messages bodies that carry a messages[].
@@ -592,7 +632,10 @@ async function proxy(req, res, base, opts = {}) {
     try {
       const j = JSON.parse(bodyBuf.toString());
       stream = !!j.stream;
-      if (rewriteModel && j && j.model) { j.model = rewriteModel; body = Buffer.from(JSON.stringify(j)); headers["content-type"] = "application/json"; }
+      let mutated = false;
+      if (rewriteModel && j && j.model) { j.model = rewriteModel; mutated = true; }
+      if (lane === "wrappy" && j) { const before = j.max_tokens; floorWrappyTokens(j); if (j.max_tokens !== before) mutated = true; }
+      if (mutated) { body = Buffer.from(JSON.stringify(j)); headers["content-type"] = "application/json"; }
     } catch { /* leave body as-is */ }
   }
   // Common fields for the call-log row.
@@ -778,6 +821,7 @@ async function jsonEnforce(req, res, route) {
       ? parsed.choices[0].message.content : null });
   reqObj.stream = false;                                   // must see the whole body to validate
   if (rewriteModel) reqObj.model = rewriteModel;
+  if (lane === "wrappy") floorWrappyTokens(reqObj);        // don't starve the claudebox agent (hangs)
   const messages = Array.isArray(reqObj.messages) ? reqObj.messages.slice() : [];
   const rf = reqObj.response_format;
   const rfType = typeof rf === "string" ? rf : (rf && rf.type);
@@ -941,8 +985,23 @@ function defaultRouteResolved(why) {
   return { ...laneRoute(d.lane, d.model, `default route (${why})`), via: "default" };
 }
 
+// Turn a per-project / per-group rule ({lane,model} or {block:true}) into a concrete route.
+function projectRule(rule, m, label) {
+  if (rule.block)
+    return { lane: "blocked", blocked: true, why: `${label} is blocked (token spend disabled)`, reason: `blocked: ${label}` };
+  return laneRoute(rule.lane, rule.model || m, `override: ${label}`);
+}
+// First projectGroup whose prefix matches this project slug (exact or startsWith). null if none.
+function matchProjectGroup(pkey) {
+  for (const g of CFG.projectGroups || [])
+    for (const pre of g.prefixes || [])
+      if (pkey === pre || pkey.startsWith(pre)) return g;
+  return null;
+}
+
 // Resolve a model name into a concrete upstream route. Priority:
-//   0. projectRoutes (per-project override — beats everything)
+//   0a. projectRoutes (exact per-project override — beats everything, incl. group rules)
+//   0b. projectGroups (prefix-matched group override)
 //   1. forceModel (global override)  2. modelRoutes (per-model, any lane)  3. local alias map
 //   4. wrappy prefix  5. empty model → default route  6. cloud policy (open/allowlist/off)
 function resolveRoute(model, project) {
@@ -950,7 +1009,11 @@ function resolveRoute(model, project) {
   const key = m.toLowerCase();
   const pkey = project == null ? "" : String(project).trim().toLowerCase();
   if (pkey && CFG.projectRoutes && CFG.projectRoutes[pkey])
-    return laneRoute(CFG.projectRoutes[pkey].lane, CFG.projectRoutes[pkey].model || m, `project override: ${pkey}`);
+    return projectRule(CFG.projectRoutes[pkey], m, `project ${pkey}`);
+  if (pkey) {
+    const g = matchProjectGroup(pkey);
+    if (g) return projectRule(g, m, `group ${g.name}`);
+  }
   if (CFG.forceModel && CFG.forceModel.enabled && CFG.forceModel.model)
     return laneRoute(CFG.forceModel.lane, CFG.forceModel.model, "forced (global)");
   if (CFG.modelRoutes && CFG.modelRoutes[key])
@@ -1033,6 +1096,7 @@ function adminState() {
     forceModel: CFG.forceModel,
     modelRoutes: CFG.modelRoutes,
     projectRoutes: CFG.projectRoutes,
+    projectGroups: CFG.projectGroups,
     cloudPolicy: CFG.cloudPolicy,
     cloudAllowlist: CFG.cloudAllowlist,
     defaultRoute: CFG.defaultRoute,
@@ -1154,6 +1218,7 @@ async function handleAdminApi(req, res, path) {
     if (patch.forceModel) next.forceModel = patch.forceModel;
     if (patch.modelRoutes) next.modelRoutes = patch.modelRoutes;
     if (patch.projectRoutes) next.projectRoutes = patch.projectRoutes;
+    if (patch.projectGroups) next.projectGroups = patch.projectGroups;
     if (patch.cloudPolicy) next.cloudPolicy = patch.cloudPolicy;
     if (patch.cloudAllowlist) next.cloudAllowlist = patch.cloudAllowlist;
     if (patch.defaultRoute) next.defaultRoute = patch.defaultRoute;

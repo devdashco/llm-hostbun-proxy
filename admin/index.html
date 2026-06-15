@@ -154,8 +154,19 @@ details.adv>summary:hover{color:var(--fg)}
 
     <!-- HERO: per-project model -->
     <div class="card" style="border-color:var(--acc)">
-      <h3 style="color:var(--fg);font-size:16px">🎯 Per-project model <small class="hint">— pick a model per app. <b>Auto</b> = normal routing. Overrides everything below.</small></h3>
+      <h3 style="color:var(--fg);font-size:16px">🎯 Per-project model <small class="hint">— pick a model per app. <b>Auto</b> = normal routing. <b>🚫 Block</b> = reject (0 tokens). Beats groups + everything below.</small></h3>
       <table id="projrouttbl"><tr><th style="width:40%">Project</th><th>Model</th></tr></table>
+    </div>
+
+    <!-- Project groups -->
+    <div class="card" style="border-color:var(--acc)">
+      <h3 style="color:var(--fg);font-size:16px">👥 Project groups <small class="hint">— bundle many projects by name prefix (e.g. <code>seoul:</code> catches every <code>seoul:*</code> lane) and route or <b>🚫 block</b> them together. A per-project model above overrides its group.</small></h3>
+      <table id="projgrptbl"><tr><th style="width:22%">Group</th><th style="width:34%">Prefixes</th><th>Model / action</th><th style="width:40px"></th></tr></table>
+      <div class="row" style="margin-top:8px">
+        <input id="newgrpname" placeholder="group name (e.g. seoul)" style="flex:1"/>
+        <input id="newgrpprefix" placeholder="prefixes, comma-sep (e.g. seoul:)" style="flex:2"/>
+        <button onclick="addGroup()" style="flex:0 0 auto">+ add group</button>
+      </div>
     </div>
 
     <!-- Operational toggles -->
@@ -363,9 +374,9 @@ function selTab(name){
 
 // ---- render state ----
 function renderState(s){
-  S=s; if(!S.modelRoutes)S.modelRoutes={}; if(!S.projectRoutes)S.projectRoutes={};
+  S=s; if(!S.modelRoutes)S.modelRoutes={}; if(!S.projectRoutes)S.projectRoutes={}; if(!Array.isArray(S.projectGroups))S.projectGroups=[];
   // overview
-  $('ovcfgpre').textContent=JSON.stringify({forceModel:s.forceModel,modelRoutes:s.modelRoutes,projectRoutes:s.projectRoutes,cloudPolicy:s.cloudPolicy,cloudAllowlist:s.cloudAllowlist,defaultRoute:s.defaultRoute,localMap:s.localMap,gatedModels:s.gatedModels,bases:s.bases,jsonEnforce:s.jsonEnforce,configPersisted:s.configPersisted},null,2);
+  $('ovcfgpre').textContent=JSON.stringify({forceModel:s.forceModel,modelRoutes:s.modelRoutes,projectRoutes:s.projectRoutes,projectGroups:s.projectGroups,cloudPolicy:s.cloudPolicy,cloudAllowlist:s.cloudAllowlist,defaultRoute:s.defaultRoute,localMap:s.localMap,gatedModels:s.gatedModels,bases:s.bases,jsonEnforce:s.jsonEnforce,configPersisted:s.configPersisted},null,2);
   // routing forms
   $('b-local').value=s.bases.local; $('b-crazy').value=s.bases.crazyrouter; $('b-claude').value=s.bases.wrappy;
   $('claudePrefix').value=s.wrappyPrefix; $('jsonEnforce').checked=!!s.jsonEnforce; $('jsonMaxRetries').value=s.jsonMaxRetries;
@@ -377,7 +388,7 @@ function renderState(s){
   document.querySelectorAll('input[name=cp]').forEach(r=>r.checked=(r.value===(s.cloudPolicy||'open')));
   $('cloudAllowlist').value=(s.cloudAllowlist||[]).join(', ');
   const dr=s.defaultRoute||{}; $('drLane').value=dr.lane||'none'; $('drModel').value=dr.model||'';
-  renderMap(); renderRoutes(); renderProjRoutes(); fillProjectList();
+  renderMap(); renderRoutes(); renderProjGroups(); renderProjRoutes(); fillProjectList();
   // secrets
   $('m-claude').textContent=s.wrappyTokenMasked||'(none)';
   $('m-oblit').textContent=s.oblitTokenSet?s.oblitTokenMasked:'(open — no gate)';
@@ -436,14 +447,30 @@ const PROJ_MODELS=[
   {lane:'local',model:'google/gemma-4-26b-a4b'},
 ];
 let KNOWN_PROJECTS=[];
-function projOpts(cur){
-  const sel=cur?`${cur.lane}|${cur.model}`:'';
+const BLOCK_VAL='__block__';
+// Options for a routing rule dropdown. cur = null (auto) | {block:true} | {lane,model}.
+function ruleOpts(cur){
+  const blocked=!!(cur&&cur.block);
+  const sel=(cur&&!cur.block)?`${cur.lane}|${cur.model}`:'';
   let extra='';
   // If the saved override isn't one of the presets, keep it as a selectable option.
-  if(cur && !PROJ_MODELS.some(p=>p.lane===cur.lane&&p.model===cur.model))
+  if(cur && !cur.block && !PROJ_MODELS.some(p=>p.lane===cur.lane&&p.model===cur.model))
     extra=`<option value="${esc(sel)}" selected>${esc(cur.lane)}: ${esc(cur.model||'(keep caller\'s)')}</option>`;
   const opts=PROJ_MODELS.map(p=>{const v=`${p.lane}|${p.model}`;return `<option value="${esc(v)}"${v===sel?' selected':''}>${esc(p.lane)}: ${esc(p.model)}</option>`;}).join('');
-  return `<option value=""${sel?'':' selected'}>— auto (normal routing) —</option>${extra}${opts}`;
+  return `<option value=""${(!cur)?' selected':''}>— auto (normal routing) —</option>`
+        +`<option value="${BLOCK_VAL}"${blocked?' selected':''}>🚫 block — reject (0 tokens)</option>`
+        +`${extra}${opts}`;
+}
+// Convert a dropdown value back into a rule object (or null for auto).
+function valToRule(val){
+  if(!val)return null;
+  if(val===BLOCK_VAL)return{block:true};
+  const [lane,...rest]=val.split('|'); return{lane,model:rest.join('|')};
+}
+function rulePill(cur){
+  if(cur&&cur.block)return`<span class="pill down">🚫 blocked</span>`;
+  if(cur)return`<span class="pill ${laneCls[cur.lane]||''}">${esc(cur.lane)}</span>`;
+  return`<span class="pill mut" style="opacity:.5">auto</span>`;
 }
 function renderProjRoutes(){
   const t=$('projrouttbl'); if(!t)return; t.querySelectorAll('tr:not(:first-child)').forEach(r=>r.remove());
@@ -452,15 +479,59 @@ function renderProjRoutes(){
   if(!list.length){ const tr=document.createElement('tr'); tr.innerHTML=`<td colspan="2" class="mut">no projects seen yet — they appear once apps send an X-Project header</td>`; t.appendChild(tr); return; }
   list.forEach(k=>{
     const cur=S.projectRoutes[k];
-    const pill=cur?`<span class="pill ${laneCls[cur.lane]||''}">${esc(cur.lane)}</span>`:`<span class="pill mut" style="opacity:.5">auto</span>`;
+    const grp=cur?null:matchGroupFor(k); // show inherited group rule when no explicit per-project override
+    const pill=cur?rulePill(cur):(grp?`<span class="pill ${grp.block?'down':(laneCls[grp.lane]||'')}" title="from group ${esc(grp.name)}">${grp.block?'🚫':esc(grp.lane)} ·grp</span>`:rulePill(null));
     const tr=document.createElement('tr');
-    tr.innerHTML=`<td class="mono">${esc(k)}</td><td><div class="flex"><span style="flex:0 0 86px">${pill}</span><select onchange="setProjModel('${esc(k)}',this.value)" style="flex:1">${projOpts(cur)}</select></div></td>`;
+    tr.innerHTML=`<td class="mono">${esc(k)}</td><td><div class="flex"><span style="flex:0 0 96px">${pill}</span><select onchange="setProjModel('${esc(k)}',this.value)" style="flex:1">${ruleOpts(cur)}</select></div></td>`;
     t.appendChild(tr);
   });
 }
+// Mirror server-side matchProjectGroup: first group whose prefix matches the project slug.
+function matchGroupFor(pkey){
+  const p=String(pkey||'').toLowerCase();
+  for(const g of S.projectGroups||[]) for(const pre of g.prefixes||[]) if(p===pre||p.startsWith(pre)) return g;
+  return null;
+}
 function setProjModel(k,val){
-  if(!val) delete S.projectRoutes[k];
-  else { const [lane,...rest]=val.split('|'); S.projectRoutes[k]={lane,model:rest.join('|')}; }
+  const rule=valToRule(val);
+  if(!rule) delete S.projectRoutes[k]; else S.projectRoutes[k]=rule;
+  renderProjRoutes(); toast('changed (unsaved) — click Save routing');
+}
+
+// ---- project groups ----
+function renderProjGroups(){
+  const t=$('projgrptbl'); if(!t)return; t.querySelectorAll('tr:not(:first-child)').forEach(r=>r.remove());
+  const groups=S.projectGroups||[];
+  if(!groups.length){ const tr=document.createElement('tr'); tr.innerHTML=`<td colspan="4" class="mut">no groups — add one below to route or block a set of projects by prefix</td>`; t.appendChild(tr); return; }
+  groups.forEach((g,i)=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td class="mono">${esc(g.name)}</td>`
+      +`<td><input value="${esc((g.prefixes||[]).join(', '))}" onchange="setGroupPrefixes(${i},this.value)" style="width:100%" class="mono"/></td>`
+      +`<td><div class="flex"><span style="flex:0 0 96px">${rulePill(g)}</span><select onchange="setGroupModel(${i},this.value)" style="flex:1">${ruleOpts(g)}</select></div></td>`
+      +`<td><button class="ghost" onclick="delGroup(${i})" title="remove group">✕</button></td>`;
+    t.appendChild(tr);
+  });
+}
+function addGroup(){
+  const name=$('newgrpname').value.trim();
+  const prefixes=$('newgrpprefix').value.split(',').map(x=>x.trim().toLowerCase()).filter(Boolean);
+  if(!name){toast('group name required',true);return;}
+  if(!prefixes.length){toast('at least one prefix required',true);return;}
+  if((S.projectGroups||[]).some(g=>g.name.toLowerCase()===name.toLowerCase())){toast('group name already exists',true);return;}
+  S.projectGroups=S.projectGroups||[]; S.projectGroups.push({name,prefixes,block:true});
+  $('newgrpname').value='';$('newgrpprefix').value='';
+  renderProjGroups(); renderProjRoutes(); toast('added (unsaved) — defaults to 🚫 block; pick a model if you want routing, then Save');
+}
+function delGroup(i){ S.projectGroups.splice(i,1); renderProjGroups(); renderProjRoutes(); toast('removed (unsaved) — click Save routing'); }
+function setGroupModel(i,val){
+  const g=S.projectGroups[i]; const rule=valToRule(val);
+  const prefixes=g.prefixes, name=g.name;
+  if(!rule) S.projectGroups[i]={name,prefixes,block:false,lane:'',model:''}; // auto = inert group (kept for editing)
+  else S.projectGroups[i]=Object.assign({name,prefixes},rule);
+  renderProjGroups(); renderProjRoutes(); toast('changed (unsaved) — click Save routing');
+}
+function setGroupPrefixes(i,val){
+  S.projectGroups[i].prefixes=val.split(',').map(x=>x.trim().toLowerCase()).filter(Boolean);
   renderProjRoutes(); toast('changed (unsaved) — click Save routing');
 }
 // Pull the live project list from stats so the table lists every app.
@@ -484,6 +555,7 @@ async function saveRouting(){
     localMap:S.localMap,
     modelRoutes:S.modelRoutes,
     projectRoutes:S.projectRoutes,
+    projectGroups:S.projectGroups,
     forceModel:{enabled:$('forceEnabled').checked,lane:$('forceLane').value,model:$('forceModel').value.trim()},
     wrappyFallback:{enabled:$('wfEnabled').checked,model:$('wfModel').value.trim()},
     cloudPolicy:cp,
