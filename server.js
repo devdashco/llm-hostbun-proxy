@@ -33,6 +33,19 @@ const crypto = require("crypto");
 const url = require("url");
 const { Readable } = require("stream");
 
+// A single malformed request must NEVER take down the whole proxy. This is a
+// stateless per-request router, so a thrown error in one handler is isolated —
+// log it and keep serving every other lane. (Root cause this guards: the wrappy
+// quota-sniff consumes up.body via arrayBuffer(); on a failover path that left
+// up.body locked, Readable.fromWeb(up.body) threw ERR_INVALID_STATE and
+// crash-looped the container ~150x, 308/502'ing every lane incl. funnel-articles.)
+process.on("uncaughtException", (err) => {
+  console.error(`[fatal-guard] uncaughtException: ${err && err.stack ? err.stack : err}`);
+});
+process.on("unhandledRejection", (err) => {
+  console.error(`[fatal-guard] unhandledRejection: ${err && err.stack ? err.stack : err}`);
+});
+
 const PORT = parseInt(process.env.PORT || "80", 10);
 const DOCS_FILE = process.env.DOCS_FILE || "/srv/docs/index.html";
 const ADMIN_FILE = process.env.ADMIN_FILE || "/srv/admin/index.html";
@@ -725,7 +738,7 @@ async function proxy(req, res, base, opts = {}) {
         error: up.status >= 400 ? `upstream ${up.status}` : null });
     }
     res.end(preBuf);
-  } else if (up.body) {
+  } else if (up.body && !up.bodyUsed) {
     const r = Readable.fromWeb(up.body);
     if (recordThis) {
       const chunks = []; let size = 0;
