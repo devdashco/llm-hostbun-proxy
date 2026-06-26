@@ -81,13 +81,14 @@ details.adv>summary:hover{color:var(--fg)}
 
   <!-- OVERVIEW -->
   <div class="tab" data-tab="Overview">
-    <h2>Overview</h2>
+    <h2>Overview <button class="ghost sm" style="float:right" onclick="loadHealth()">↻ Refresh</button></h2>
+    <div id="issues"></div>
     <div class="grid" id="ovgrid"></div>
     <div class="card">
-      <h3>Lane health</h3>
-      <table id="healthtbl"><tr><th>Lane</th><th>Target</th><th>Status</th><th>Latency</th><th>Models</th></tr></table>
+      <h3>Lane health <small class="hint">— live probe + last-hour traffic</small></h3>
+      <table id="healthtbl"><tr><th>Lane</th><th>Target</th><th>Probe</th><th>RTT</th><th>Models</th><th>Calls 1h</th><th>Avg</th><th>Err</th></tr></table>
     </div>
-    <div class="card" id="ovcfg"><h3>Effective config</h3><pre id="ovcfgpre">loading…</pre></div>
+    <details class="adv"><summary>Effective config (raw JSON)</summary><pre id="ovcfgpre">loading…</pre></details>
   </div>
 
   <!-- CALLS -->
@@ -591,27 +592,60 @@ async function changePw(){
 }
 
 // ---- health / overview ----
+function fmtMs(ms){ if(ms==null)return'—'; return ms>=1000?(ms/1000).toFixed(ms>=10000?0:1)+'s':Math.round(ms)+'ms'; }
+const SLOW_MS=30000; // a lane whose 1h-avg latency exceeds this is flagged as slow
+
 async function loadHealth(){
-  let h; try{h=await api('health');}catch(e){return;}
-  const rows=[['local',S.bases.local,h.local,''],['wrappy',S.bases.wrappy,h.wrappy,''],['crazyrouter',S.bases.crazyrouter,h.crazyrouter,'']];
+  let h,st;
+  try{ [h,st]=await Promise.all([api('health'),api('stats?window=1h')]); }
+  catch(e){ try{h=await api('health');}catch{return;} st=null; }
+  const laneStat={}; (st&&st.byLane||[]).forEach(r=>laneStat[r.lane]=r);
+  const lanes=[['local',S.bases.local,h.local],['wrappy',S.bases.wrappy,h.wrappy],['crazyrouter',S.bases.crazyrouter,h.crazyrouter]];
   const t=$('healthtbl'); t.querySelectorAll('tr:not(:first-child)').forEach(r=>r.remove());
-  rows.forEach(([lane,base,r])=>{
+  lanes.forEach(([lane,base,r])=>{
+    const ls=laneStat[lane]||{};
+    const probe=r.up?`<span class="pill up">UP ${r.status}</span>`:`<span class="pill down">DOWN ${r.status||''}</span>`;
+    const slow=ls.avg_ms>SLOW_MS, errd=ls.errors>0;
     const tr=document.createElement('tr');
-    const st=r.up?`<span class="pill up">UP ${r.status}</span>`:`<span class="pill down">DOWN ${r.status||''}</span>`;
-    tr.innerHTML=`<td><span class="pill ${lane}">${lane}</span></td><td class="mono" style="font-size:12px">${esc(base)}</td><td>${st}</td><td>${r.ms}ms</td><td>${r.count??'—'}</td>`;
+    tr.innerHTML=`<td><span class="pill ${lane}">${lane}</span></td><td class="mono" style="font-size:12px">${esc(base)}</td>`+
+      `<td>${probe}</td><td class="mono">${r.ms}ms</td><td>${r.count??'—'}</td>`+
+      `<td class="mono">${ls.n??'—'}</td>`+
+      `<td class="mono"${slow?' style="color:var(--amb);font-weight:700"':''}>${fmtMs(ls.avg_ms)}</td>`+
+      `<td class="mono"${errd?' style="color:var(--red);font-weight:700"':''}>${ls.errors??'—'}</td>`;
     t.appendChild(tr);
   });
-  // overview cards
+  renderOvCards(h);
+  renderIssues(h,st);
+}
+function renderOvCards(h){
   const up=[h.local,h.wrappy,h.crazyrouter].filter(x=>x&&x.up).length;
   const fm=S.forceModel||{};
   $('ovgrid').innerHTML=
-    kv('Lanes up',up+' / 3')+
+    kv('Lanes up',(up<3?'<span class="down">':'')+up+' / 3'+(up<3?'</span>':''))+
     kv('Force model',fm.enabled?`<span class="warnp">${esc(fm.lane)}/${esc(fm.model)}</span>`:'off')+
-    kv('Wrappy failover',(S.wrappyFallback&&S.wrappyFallback.enabled)?`→ crazyrouter${S.wrappyFallback.model?' ('+esc(S.wrappyFallback.model)+')':''}`:'off')+
+    kv('Wrappy failover',(S.wrappyFallback&&S.wrappyFallback.enabled)?`→ crazyrouter${S.wrappyFallback.model?' ('+esc(S.wrappyFallback.model)+')':''}`:'<span class="warnp">off</span>')+
     kv('Cloud policy',S.cloudPolicy||'open')+
-    kv('Overrides',Object.keys(S.modelRoutes||{}).length)+
+    kv('Project gate',S.requireProject?'required':'off')+
     kv('JSON enforce',S.jsonEnforce?'ON':'OFF')+
     kv('Config',S.configPersisted?'file-backed':'env defaults');
+}
+// Auto-diagnose: scan the live probe + last-hour stats and surface anything worth a human look.
+function renderIssues(h,st){
+  const box=$('issues'); if(!box)return;
+  const probs=[];
+  ['local','wrappy','crazyrouter'].forEach(l=>{ const r=h[l]; if(r&&!r.up) probs.push(['down',`Lane <b>${l}</b> is DOWN (status ${r.status||'—'}). Traffic to it will fail.`]); });
+  if(st&&st.byLane){
+    st.byLane.forEach(r=>{ if(r.avg_ms>SLOW_MS) probs.push(['slow',`Lane <b>${esc(r.lane)}</b> is slow — avg <b>${fmtMs(r.avg_ms)}</b> over the last hour (${r.n} calls). Callers may be timing out.`]); });
+    if(st.windowJsonFails>0) probs.push(['refusal',`<b>${st.windowJsonFails}</b> JSON-enforce failure${st.windowJsonFails>1?'s':''} in the last hour — usually the model refusing in prose while the caller demanded JSON, surfaced as 422. <span class="mut">Not a proxy bug.</span>`]);
+    const otherErr=st.windowErrors-(st.windowJsonFails||0);
+    const rate=st.windowCalls>0?otherErr/st.windowCalls:0;
+    if(rate>0.05 && st.windowCalls>=20) probs.push(['err',`Non-refusal error rate <b>${(rate*100).toFixed(0)}%</b> over the last hour (${otherErr}/${st.windowCalls}).`]);
+  }
+  if(S.forceModel&&S.forceModel.enabled) probs.push(['force',`Force-model is ON → every request rewritten to <b>${esc(S.forceModel.lane)}/${esc(S.forceModel.model)}</b>, ignoring the caller's model.`]);
+  if(!probs.length){ box.innerHTML=`<div class="card" style="border-color:var(--grn);background:#0f1f14"><b style="color:var(--grn)">✓ All healthy</b> <span class="mut">— lanes up, no slow lanes or elevated errors in the last hour.</span></div>`; return; }
+  const ic={down:'⛔',slow:'🐢',refusal:'🙅',err:'⚠️',force:'⏻'};
+  box.innerHTML=`<div class="card" style="border-color:var(--amb);background:#1f1a0e"><b style="color:var(--amb)">${probs.length} thing${probs.length>1?'s':''} to look at</b><ul style="margin:8px 0 0;padding-left:20px;list-style:none">`+
+    probs.map(([k,m])=>`<li style="margin:5px 0">${ic[k]||'•'} ${m}</li>`).join('')+`</ul></div>`;
 }
 function kv(n,v){return `<div class="kv"><div class="n">${n}</div><div class="v">${v}</div></div>`;}
 
@@ -654,7 +688,7 @@ async function loadCrazy(){
     kv('Used',c.totalUsageUsd!=null?('$'+c.totalUsageUsd.toFixed(2)):'—')+
     kv('Remaining',c.remainingUsd!=null?('$'+c.remainingUsd.toFixed(2)):'—')+
     kv('Models',c.modelCount??'—')+
-    kv('Key',c.keyMasked||'(none)');
+    kv('Key id',c.keyMasked||'(none)');
   const msg=$('crazymsg');
   if(c.message||!c.keyValid){ msg.classList.remove('hide'); msg.textContent=(c.message||'key check failed')+(c.statuses?(' · statuses '+JSON.stringify(c.statuses)):''); }
   else msg.classList.add('hide');
@@ -686,7 +720,9 @@ async function loadCalls(){
   const t=$('callstbl'); t.querySelectorAll('tr:not(:first-child)').forEach(r=>r.remove());
   d.rows.forEach(r=>{
     const tr=document.createElement('tr'); tr.style.cursor='pointer'; tr.onclick=()=>showCall(r.id);
-    const st=r.status>=400?`<span class="pill down">${r.status}</span>`:`<span class="pill up">${r.status||'—'}</span>`;
+    const refusal=r.status>=400 && /^json_validation_failed/.test(r.error||'');
+    const st=refusal?`<span class="pill warnp" title="model refused in prose; caller wanted JSON — not a proxy bug">🙅 ${r.status}</span>`
+      :r.status>=400?`<span class="pill down">${r.status}</span>`:`<span class="pill up">${r.status||'—'}</span>`;
     const lane=`<span class="pill ${laneCls[r.lane]||''}">${esc(r.lane||'?')}</span>`;
     const proj=r.project?`<span class="pill" style="background:#2a3a2a;color:#8bc88b">${esc(r.project)}</span>`:`<span class="mut" style="font-size:11px">(none)</span>`;
     tr.innerHTML=`<td class="mono" style="font-size:12px;white-space:nowrap">${fmtTime(r.ts)}</td>`+
@@ -739,7 +775,7 @@ async function loadStats(){
   fill('bymodeltbl',s.byModel||[],r=>`<td class="mono" style="font-size:12px">${esc(r.req_model||'-')}</td><td><span class="pill ${laneCls[r.lane]||''}">${esc(r.lane||'?')}</span></td><td class="mono">${r.n}</td><td class="mono">${(r.tok||0).toLocaleString()}</td><td class="mono">${r.avg_ms??'—'}</td>`);
   fill('byprojecttbl',s.byProject||[],r=>{
     const errPct=r.n>0?(r.errors/r.n*100).toFixed(1):'0.0';
-    const errCls=r.errors>0?'style="color:var(--err)"':'class="mut"';
+    const errCls=r.errors>0?'style="color:var(--red);font-weight:700"':'class="mut"';
     return `<td class="mono" style="font-size:12px">${esc(r.project||'(none)')}</td><td class="mono">${r.n}</td><td class="mono">${(r.tok||0).toLocaleString()}</td><td class="mono" ${errCls}>${r.errors}</td><td class="mono" ${errCls}>${errPct}%</td>`;
   });
   KNOWN_PROJECTS=(s.byProject||[]).map(r=>r.project).filter(Boolean); renderProjRoutes();

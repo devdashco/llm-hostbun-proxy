@@ -1350,14 +1350,19 @@ async function handleAdminApi(req, res, path) {
       const windowCalls = db.prepare(`SELECT COUNT(*) n FROM calls WHERE ${W}`).get(since).n;
       const windowErrors = db.prepare(`SELECT COUNT(*) n FROM calls WHERE ${W} AND status >= 400`).get(since).n;
       const windowTokens = db.prepare(`SELECT COALESCE(SUM(total_tokens),0) t FROM calls WHERE ${W}`).get(since).t;
-      const byLane = db.prepare(`SELECT lane, COUNT(*) n, COALESCE(SUM(total_tokens),0) tok FROM calls WHERE ${W} GROUP BY lane ORDER BY n DESC`).all(since);
+      // json-enforce failures are almost always model refusals (caller asked for JSON, model replied in prose);
+      // surfaced here so the dashboard can flag them as "not a proxy bug" rather than burying them in error count.
+      const windowJsonFails = db.prepare(`SELECT COUNT(*) n FROM calls WHERE ${W} AND error LIKE 'json_validation_failed%'`).get(since).n;
+      const byLane = db.prepare(`SELECT lane, COUNT(*) n, COALESCE(SUM(total_tokens),0) tok,
+        ROUND(AVG(duration_ms)) avg_ms, SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) errors
+        FROM calls WHERE ${W} GROUP BY lane ORDER BY n DESC`).all(since);
       const byKey = db.prepare(`SELECT key_label, COUNT(*) n FROM calls WHERE ${W} GROUP BY key_label ORDER BY n DESC`).all(since);
       const byModel = db.prepare(`SELECT req_model, lane, COUNT(*) n, COALESCE(SUM(total_tokens),0) tok, ROUND(AVG(duration_ms)) avg_ms FROM calls WHERE ${W} GROUP BY req_model ORDER BY n DESC LIMIT 30`).all(since);
       const byProject = db.prepare(`SELECT COALESCE(NULLIF(project,''),'(none)') project, COUNT(*) n,
         COALESCE(SUM(total_tokens),0) tok, SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) errors
         FROM calls WHERE ${W} GROUP BY COALESCE(NULLIF(project,''),'(none)') ORDER BY n DESC LIMIT 50`).all(since);
       const oldest = db.prepare("SELECT MIN(ts) t FROM calls").get().t;
-      return sendJson(res, 200, { dbReady: true, window: winKey, total, windowCalls, windowErrors, windowTokens, byLane, byKey, byModel, byProject, oldest, retain: CFG.logging.retain });
+      return sendJson(res, 200, { dbReady: true, window: winKey, total, windowCalls, windowErrors, windowTokens, windowJsonFails, byLane, byKey, byModel, byProject, oldest, retain: CFG.logging.retain });
     } catch (e) { return sendJson(res, 500, { error: e.message }); }
   }
   if (sub === "calls/clear" && req.method === "POST") {
