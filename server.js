@@ -1,21 +1,21 @@
 // llm.hostbun.cc — single-URL OpenAI router + admin UI.
 //
-// THREE PROVIDERS (lanes):
-//   • local       -> llama.cpp on pbox GPU @ pbox.llm.hostbun.cc (qwen3.5-9b, no key)
+// PROVIDERS (lanes):
 //   • crazyrouter -> crazyrouter.com cloud relay (CRAZYROUTER_KEY injected server-side)
 //   • wrappy      -> claudebox / claude-code OpenAI shim @ claude.hostbun.cc (wrappyToken injected)
+//   • local       -> live llama.cpp on the pbox GPU (set via config.json, e.g. qwen3.5-9b); legacy
+//                    local ids that have no backend redirect to wrappy via modelRoutes.
 //
-//   model "local"                                        -> local gemma-4-e4b-it-obliterated (DEFAULT, multimodal, open)
-//   model "gemma-4-e4b-it-obliterated"                   -> same (full id)
-//   model "gemma" / "google/gemma-4-26b-a4b"             -> local gemma 26B MoE, no key
-//   model "obliterated" / "qwen3.6-27b-obliterated"      -> local Qwen3.6-27B abliterated (Bearer-gated if OBLIT_TOKEN set)
+//   model "local" / "qwen3.5-9b"                         -> local llama.cpp lane (pbox GPU)
+//   model "gemma" / "obliterated" / "gemma-4-e4b-it-obliterated" / "google/gemma-4-26b-a4b"
+//                                                        -> wrappy (claude-sonnet-4-6, multimodal) via modelRoutes
 //   model "claude*" (e.g. claude-sonnet-4-6)             -> wrappy (claudebox), token injected
 //   any other model                                      -> crazyrouter, key injected
-//   (local models JIT-swap in VRAM — they don't all fit at once)
+//   model "imagegen"  +  POST /v1/images/*               -> image generation (SD-Turbo on the pbox GPU)
 //   GET /v1/models                            -> local + wrappy + crazyrouter list (merged)
 //   /docs, docs.<host>                         -> docs page
 //   /prices(.json)                             -> computed price feed (CORS *)
-//   /local/*                                   -> kept for back-compat (strips /local -> pbox.llm.hostbun.cc)
+//   /local/*                                   -> back-compat: strips /local, proxies to the local lane (pbox)
 //   /admin, /admin/api/*                       -> password-gated admin UI (edit routing/models/keys live)
 //
 // Routing is driven by a live, mutable CFG object. CFG is seeded from env defaults and then
@@ -113,7 +113,9 @@ function sanitizeLimit(v) {
 function envDefaults() {
   return {
     bases: {
-      local: (process.env.LOCAL_BASE || "https://pbox.llm.hostbun.cc").replace(/\/$/, ""),
+      // local llama.cpp lane on the pbox GPU. The live base is supplied by config.json in prod
+      // (the old LM Studio backend is gone) — default empty so a bare deploy points at nothing.
+      local: (process.env.LOCAL_BASE || "").replace(/\/$/, ""),
       crazyrouter: (process.env.CRAZYROUTER_BASE || process.env.CRAZY_BASE || "https://crazyrouter.com").replace(/\/$/, ""),
       wrappy: (process.env.WRAPPY_BASE || process.env.CLAUDE_BASE || "https://claude.hostbun.cc").replace(/\/$/, ""),
       // image generation lane (SD-Turbo on the pbox GPU). Routed by path, not model name.
@@ -140,23 +142,23 @@ function envDefaults() {
     // token = open. gemma + crazyrouter stay open so fb-bot/promopilot are unaffected.
     oblitToken: process.env.OBLIT_TOKEN || "",
     gatedModels: [OBLIT],
-    // LOCAL LANE: llama.cpp on the pbox GPU (qwen3.5-9b) via pbox.llm.hostbun.cc — replaced the
-    // retired LM Studio @ llm.bofrid.dev. Ids "local"/"qwen"/"qwen3.5-9b" resolve to the local lane.
-    // The old LM Studio ids (gemma / obliterated / qwen3.6-27b-obliterated) no longer exist locally,
-    // so they're redirected to wrappy (multimodal Claude) via modelRoutes below — old callers keep working.
-    localMap: { local: "qwen3.5-9b", qwen: "qwen3.5-9b", "qwen3.5-9b": "qwen3.5-9b" },
+    // localMap: alias -> local-model-id (resolves the local lane). The old LM Studio backend is
+    // gone; the env seed ships this EMPTY (local lane off by default) and the legacy ids
+    // ("local"/"gemma"/"obliterated"/...) fall through to wrappy via modelRoutes below. Production
+    // re-enables the lane via config.json — it points bases.local at the live llama.cpp server on
+    // the pbox GPU and maps e.g. "local"/"qwen3.5-9b" -> qwen3.5-9b there.
+    localMap: {},
     // ── flow control (admin-editable) ──
     // forceModel: when enabled, EVERY request is rewritten to this lane+model regardless of what
     // the caller asked for. The big red switch.
     forceModel: { enabled: false, lane: "wrappy", model: "" },
     // modelRoutes: explicit per-incoming-model overrides to ANY lane (highest priority after
     // forceModel). key = incoming model name (lowercased). value = { lane, model }.
-    // The legacy LM Studio model ids (no longer served locally) are redirected here to wrappy
-    // (claude-sonnet-4-6 is multimodal), so requests that still ask for "gemma"/"obliterated" —
-    // including image analysis — are served by Claude. "local"/"qwen" are NOT here: they fall
-    // through to the localMap above and hit the live pbox llama.cpp lane.
+    // The legacy local model ids are redirected here to wrappy (claude-sonnet-4-6 is multimodal),
+    // so requests that still ask for "local"/"gemma"/"obliterated" — including image analysis —
+    // are served by Claude instead of the retired LM Studio backend.
     modelRoutes: Object.fromEntries(
-      ["gemma", "gemma-4-e4b-it-obliterated", "google/gemma-4-26b-a4b",
+      ["local", "gemma", "gemma-4-e4b-it-obliterated", "google/gemma-4-26b-a4b",
        "obliterated", "obliteratus", "qwen3.6-27b-obliterated"]
         .map((id) => [id, { lane: "wrappy", model: "claude-sonnet-4-6" }])
     ),

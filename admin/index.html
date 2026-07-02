@@ -66,13 +66,78 @@ details.adv>summary:hover{color:var(--fg)}
 #byprojecttbl tr[data-proj]{cursor:pointer}
 #byprojecttbl tr[data-proj]:hover td{background:#1a212b}
 .chip{font:11px ui-monospace,monospace;padding:1px 6px;border-radius:10px;border:1px solid var(--bd);color:var(--mut)}
+</style>
+<style id="shadcn">
+/* shadcn-flavoured dark theme (zinc) — overrides the base sheet above */
+:root{
+  --bg:#09090b;--card:#0c0c0f;--card2:#141417;--bd:#26262b;--fg:#fafafa;--mut:#a1a1aa;
+  --acc:#3b82f6;--grn:#22c55e;--red:#ef4444;--amb:#f59e0b;--clr:#f97316;
+  --ring:rgba(59,130,246,.35);--pri:#fafafa;--prifg:#18181b;--hover:#18181b;
+}
+.hide{display:none!important}
+html,body{background:var(--bg)}
+body{font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--fg)}
+.wrap{max-width:none;margin:0;padding:0}
+/* ── layout: sidebar + main ── */
+.shell{display:grid;grid-template-columns:252px minmax(0,1fr);min-height:100vh}
+.sidebar{position:sticky;top:0;align-self:start;height:100vh;background:var(--card);border-right:1px solid var(--bd);display:flex;flex-direction:column;padding:14px 12px;overflow-y:auto}
+.sb-brand{display:flex;align-items:center;gap:10px;padding:6px 6px 14px;border-bottom:1px solid var(--bd);margin-bottom:6px}
+.sb-brand .logo{width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,var(--acc),#8b5cf6);display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff;font-size:13px;flex:0 0 auto}
+.sb-brand .t{font-weight:600;font-size:14px;line-height:1.15}
+.sb-brand .s{font-size:11px;color:var(--mut)}
+.nav{display:flex;flex-direction:column;gap:2px;flex:1}
+.nav-sec{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);padding:14px 10px 5px;font-weight:600}
+.nav-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;color:var(--mut);cursor:pointer;font-size:13.5px;font-weight:500;text-decoration:none;border:1px solid transparent}
+.nav-item:hover{background:var(--hover);color:var(--fg);text-decoration:none}
+.nav-item.on{background:#1c1c20;color:var(--fg);border-color:var(--bd)}
+.nav-item svg{width:17px;height:17px;flex:0 0 auto}
+.sb-foot{border-top:1px solid var(--bd);padding-top:10px;margin-top:6px}
+.main{min-width:0;display:flex;flex-direction:column}
+.topbar{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--bg) 82%,transparent);backdrop-filter:blur(8px);border-bottom:1px solid var(--bd);display:flex;align-items:center;gap:8px;padding:12px 22px}
+.topbar h2{margin:0;border:0;padding:0;font-size:16px;font-weight:600}
+.topbar .crumb{color:var(--mut);font-size:13px}
+.content{padding:22px 22px 90px;max-width:1140px;width:100%}
+.hamb{display:none}
+@media(max-width:860px){
+  .shell{grid-template-columns:1fr}
+  .sidebar{position:fixed;left:0;top:0;z-index:50;width:252px;transform:translateX(-101%);transition:transform .2s;box-shadow:0 0 40px rgba(0,0,0,.5)}
+  .sidebar.open{transform:none}
+  .hamb{display:inline-flex}
+  .content{padding:18px 14px 80px}
+}
+/* ── components ── */
+.card{background:var(--card2);border:1px solid var(--bd);border-radius:14px;padding:18px;margin:14px 0}
+h2{border-bottom:1px solid var(--bd);padding-bottom:8px}
+h3{color:var(--fg);font-weight:600}
+input,select,textarea{background:var(--bg);border:1px solid var(--bd);border-radius:8px;color:var(--fg)}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px var(--ring)}
+button{background:var(--pri);color:var(--prifg);border:0;border-radius:8px;padding:8px 14px;font:600 13px -apple-system,sans-serif;cursor:pointer}
+button:hover{filter:none;background:#e4e4e7}
+button.ghost{background:transparent;color:var(--fg);border:1px solid var(--bd)}
+button.ghost:hover{background:var(--hover)}
+button.danger{background:transparent;color:var(--red);border:1px solid #7f1d1d}
+button.danger:hover{background:#2a1112}
+button.sm{padding:6px 10px;font-size:12px}
+table{border-collapse:collapse}
+th,td{border:0;border-bottom:1px solid var(--bd);padding:9px 10px}
+th{background:transparent;color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.03em;font-weight:600}
+.kv{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:14px}
+pre{background:#0b0b0e;border:1px solid var(--bd);border-radius:10px}
+code{background:#1c1c20;border:1px solid var(--bd)}
+.bar{background:#26262b}
+#toast{background:var(--card2);border:1px solid var(--bd);border-radius:10px}
+.pill{border-radius:8px;font-weight:600}
+.warn{background:#241a06;border:1px solid #7c5306;border-radius:10px}
+.login{max-width:360px;margin:12vh auto 0}
+.login .card{padding:20px}
 </style></head>
-<body><div class="wrap">
+<body>
 
 <!-- LOGIN -->
 <div id="login" class="login hide">
-  <h1>llm.hostbun.cc</h1>
-  <p class="mut">admin panel</p>
+  <div class="sb-brand" style="justify-content:center;border:0;margin:0 0 8px;padding:0"><div class="logo">hb</div></div>
+  <h1 style="font-size:20px;text-align:center">llm.hostbun.cc</h1>
+  <p class="mut" style="text-align:center">admin panel</p>
   <div class="card">
     <input id="pw" type="password" placeholder="password" autofocus onkeydown="if(event.key==='Enter')doLogin()"/>
     <div style="height:10px"></div>
@@ -82,16 +147,20 @@ details.adv>summary:hover{color:var(--fg)}
 </div>
 
 <!-- APP -->
-<div id="app" class="hide">
-  <div class="flex" style="justify-content:space-between">
-    <div><h1>llm.hostbun.cc <span class="mut" style="font-size:15px">admin</span></h1></div>
-    <div class="flex">
+<div id="app" class="shell hide">
+  <aside class="sidebar" id="sidebar">
+    <div class="sb-brand"><div class="logo">hb</div><div><div class="t">hostbun</div><div class="s">llm proxy · admin</div></div></div>
+    <nav class="nav" id="nav"></nav>
+    <div class="sb-foot"><button class="ghost sm" style="width:100%" onclick="doLogout()">Sign out</button></div>
+  </aside>
+  <div class="main">
+    <header class="topbar">
+      <button class="ghost sm hamb" onclick="$('sidebar').classList.toggle('open')">☰</button>
+      <span class="crumb">Admin<span style="opacity:.5"> / </span></span><h2 id="crumb">Overview</h2>
+      <span style="flex:1"></span>
       <button class="ghost sm" onclick="refreshAll()">↻ Refresh</button>
-      <button class="ghost sm" onclick="doLogout()">Sign out</button>
-    </div>
-  </div>
-
-  <div class="tabs" id="tabs"></div>
+    </header>
+    <div class="content">
 
   <!-- OVERVIEW -->
   <div class="tab" data-tab="Overview">
@@ -326,7 +395,7 @@ details.adv>summary:hover{color:var(--fg)}
 
       <div class="card">
         <h3>Lane base URLs <small class="hint">— the three providers</small></h3>
-        <label>local lane (llama.cpp @ pbox.llm.hostbun.cc)</label><input id="b-local"/>
+        <label>local lane (llama.cpp @ pbox GPU)</label><input id="b-local"/>
         <label>crazyrouter lane (crazyrouter.com cloud)</label><input id="b-crazy"/>
         <label>wrappy lane (claudebox / claude-code @ claude.hostbun.cc)</label><input id="b-claude"/>
         <label>wrappy prefix <small class="hint">— models starting with this route to the wrappy lane (default <code>claude</code>)</small></label><input id="claudePrefix"/>
@@ -408,7 +477,9 @@ details.adv>summary:hover{color:var(--fg)}
       <small class="hint">changing this signs you out of other sessions.</small>
     </div>
   </div>
-</div>
+    </div><!-- /.content -->
+  </div><!-- /.main -->
+</div><!-- /#app.shell -->
 
 <div id="toast"></div>
 
@@ -433,25 +504,65 @@ async function doLogin(){
   $('loginerr').classList.add('hide');
   try{
     await api('login',{method:'POST',body:JSON.stringify({password:$('pw').value})});
-    $('pw').value=''; showApp(); refreshAll();
+    $('pw').value=''; init();
   }catch(e){ $('loginerr').textContent=e.message; $('loginerr').classList.remove('hide'); }
 }
 async function doLogout(){ try{await api('logout',{method:'POST'});}catch{} showLogin(); }
 
-// ---- tabs ----
-const TABS=['Overview','Calls','Stats','Routing','Models & test','Crazyrouter','Secrets'];
-function buildTabs(){
-  const c=$('tabs'); c.innerHTML='';
-  TABS.forEach((t,i)=>{const b=document.createElement('button');b.textContent=t;b.onclick=()=>selTab(t);if(i===0)b.classList.add('on');c.appendChild(b);});
+// ---- navigation: sidebar + real per-section URLs under /admin/<slug> ----
+const BASE='/admin';
+const NAV=[
+  {sec:'Monitor'},
+  {name:'Overview',slug:'overview',icon:'grid'},
+  {name:'Calls',slug:'calls',icon:'list'},
+  {name:'Stats',slug:'stats',icon:'chart'},
+  {sec:'Control'},
+  {name:'Routing',slug:'routing',icon:'route'},
+  {name:'Models & test',slug:'models',icon:'box'},
+  {sec:'Cloud & keys'},
+  {name:'Crazyrouter',slug:'crazyrouter',icon:'cloud'},
+  {name:'Secrets',slug:'secrets',icon:'key'},
+];
+const ICON={
+  grid:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/>',
+  list:'<line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>',
+  chart:'<path d="M3 3v18h18"/><rect x="7" y="10" width="3" height="8" rx="1"/><rect x="12" y="6" width="3" height="12" rx="1"/><rect x="17" y="13" width="3" height="5" rx="1"/>',
+  route:'<circle cx="6" cy="19" r="2.5"/><circle cx="18" cy="5" r="2.5"/><path d="M8 19h6.5a3.5 3.5 0 0 0 0-7h-4a3.5 3.5 0 0 1 0-7H16"/>',
+  box:'<path d="M12 2 3 7v10l9 5 9-5V7z"/><path d="M3 7l9 5 9-5"/><path d="M12 12v10"/>',
+  cloud:'<path d="M17.5 19a4.5 4.5 0 0 0 0-9 6 6 0 0 0-11.6 1.6A3.5 3.5 0 0 0 6.5 19z"/>',
+  key:'<circle cx="8" cy="15" r="4"/><path d="M10.85 12.15 19 4M18 5l2 2M15 6l2 2"/>',
+};
+const svg=n=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICON[n]||''}</svg>`;
+const slugFor=n=>{const i=NAV.find(x=>x.name===n);return i?i.slug:'overview';};
+const nameFor=s=>{const i=NAV.find(x=>x.slug===s);return i?i.name:'Overview';};
+function buildNav(){
+  const c=$('nav'); c.innerHTML='';
+  NAV.forEach(it=>{
+    if(it.sec){const d=document.createElement('div');d.className='nav-sec';d.textContent=it.sec;c.appendChild(d);return;}
+    const a=document.createElement('a');a.className='nav-item';a.href=BASE+'/'+it.slug;a.dataset.name=it.name;
+    a.innerHTML=svg(it.icon)+`<span>${it.name}</span>`;
+    a.onclick=e=>{e.preventDefault();go(it.slug);if(window.innerWidth<=860)$('sidebar').classList.remove('open');};
+    c.appendChild(a);
+  });
 }
+// go(): update the URL then switch view. selTab() is view-only (used by popstate too).
+function go(slug){ history.pushState({},'',BASE+'/'+slug); selTab(nameFor(slug)); }
 function selTab(name){
-  [...$('tabs').children].forEach(b=>b.classList.toggle('on',b.textContent===name));
+  document.querySelectorAll('#nav .nav-item').forEach(a=>a.classList.toggle('on',a.dataset.name===name));
   document.querySelectorAll('.tab').forEach(d=>d.classList.toggle('hide',d.dataset.tab!==name));
+  $('crumb').textContent=name; document.title='hostbun · '+name;
+  if(name==='Overview') loadHealth();
   if(name==='Crazyrouter') loadCrazy();
   if(name==='Models & test') loadModels();
   if(name==='Calls') loadCalls();
   if(name==='Stats') loadStats();
 }
+function route(){
+  let s=location.pathname.replace(BASE,'').replace(/^\/+/,'').split('/')[0]||'overview';
+  if(!NAV.some(x=>x.slug===s))s='overview';
+  selTab(nameFor(s));
+}
+window.addEventListener('popstate',route);
 
 // ---- render state ----
 function renderState(s){
@@ -966,7 +1077,7 @@ function renderProjects(){
     const errCls=r.errors>0?'style="color:var(--red);font-weight:700"':'class="mut"';
     const share=(r.tok/maxT*100);
     const tr=document.createElement('tr'); tr.dataset.proj=r.project||'';
-    tr.onclick=()=>{ selTab('Calls'); $('callproject').value=(r.project&&r.project!=='(none)')?r.project:''; loadCalls(); };
+    tr.onclick=()=>{ go('calls'); $('callproject').value=(r.project&&r.project!=='(none)')?r.project:''; loadCalls(); };
     let badge='';
     if(r.limit&&r.limitPct!=null){ const sp=r.limit.slowPct||95; const col=r.limitPct>=100?'var(--red)':r.limitPct>=sp?'var(--amb)':'#3fb950';
       const cap=r.limit.tokens>0?nfmt(r.limit.tokens)+' tok':r.limit.calls>0?r.limit.calls+' calls':'';
@@ -1041,7 +1152,7 @@ async function loadRecent(){
   const t=$('recenttbl'); t.querySelectorAll('tr:not(:first-child)').forEach(r=>r.remove());
   if(!d.rows||!d.rows.length){ const tr=document.createElement('tr'); tr.innerHTML='<td colspan="6" class="mut">no calls logged yet</td>'; t.appendChild(tr); return; }
   d.rows.forEach(r=>{
-    const tr=document.createElement('tr'); tr.style.cursor='pointer'; tr.onclick=()=>{ selTab('Calls'); showCall(r.id); };
+    const tr=document.createElement('tr'); tr.style.cursor='pointer'; tr.onclick=()=>{ go('calls'); showCall(r.id); };
     const refusal=r.status>=400 && /^json_validation_failed/.test(r.error||'');
     const st=refusal?`<span class="pill warnp">🙅 ${r.status}</span>`:r.status>=400?`<span class="pill down">${r.status}</span>`:`<span class="pill up">${r.status||'—'}</span>`;
     const proj=r.project?`<span class="chip" style="color:#8bc88b">${esc(r.project)}</span>`:'<span class="mut" style="font-size:11px">(none)</span>';
@@ -1062,10 +1173,11 @@ async function refreshAll(){
   try{ const s=await api('state'); renderState(s); loadHealth(); }
   catch(e){ /* showLogin already called on 401 */ }
 }
-buildTabs();
-(async()=>{
-  try{ const s=await api('state'); showApp(); renderState(s); loadHealth(); }
+async function init(){
+  try{ const s=await api('state'); showApp(); renderState(s); route(); }
   catch(e){ showLogin(); }
-})();
+}
+buildNav();
+init();
 </script>
 </body></html>
