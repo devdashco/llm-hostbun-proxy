@@ -413,18 +413,23 @@ function initDb() {
       req_model TEXT, lane TEXT, sent_model TEXT, key_label TEXT,
       status INTEGER, duration_ms INTEGER, stream INTEGER,
       prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER,
-      error TEXT, req_content TEXT, resp_content TEXT, project TEXT
+      error TEXT, req_content TEXT, resp_content TEXT, project TEXT,
+      effort TEXT, thinking_tokens INTEGER, max_tokens INTEGER, temperature REAL
     );`);
-    // Migrate older DBs that predate the project column (idempotent — throws if it already exists).
+    // Migrate older DBs that predate later columns (each idempotent — throws if it already exists).
     try { db.exec("ALTER TABLE calls ADD COLUMN project TEXT;"); } catch { /* already there */ }
+    try { db.exec("ALTER TABLE calls ADD COLUMN effort TEXT;"); } catch { /* already there */ }
+    try { db.exec("ALTER TABLE calls ADD COLUMN thinking_tokens INTEGER;"); } catch { /* already there */ }
+    try { db.exec("ALTER TABLE calls ADD COLUMN max_tokens INTEGER;"); } catch { /* already there */ }
+    try { db.exec("ALTER TABLE calls ADD COLUMN temperature REAL;"); } catch { /* already there */ }
     db.exec("CREATE INDEX IF NOT EXISTS idx_calls_ts ON calls(ts);");
     db.exec("CREATE INDEX IF NOT EXISTS idx_calls_model ON calls(req_model);");
     db.exec("CREATE INDEX IF NOT EXISTS idx_calls_lane ON calls(lane);");
     db.exec("CREATE INDEX IF NOT EXISTS idx_calls_project ON calls(project);");
     db.exec("CREATE INDEX IF NOT EXISTS idx_calls_project_ts ON calls(project, ts);"); // per-project usage windows
     insertStmt = db.prepare(`INSERT INTO calls
-      (ts,ip,ua,method,path,req_model,lane,sent_model,key_label,status,duration_ms,stream,prompt_tokens,completion_tokens,total_tokens,error,req_content,resp_content,project)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      (ts,ip,ua,method,path,req_model,lane,sent_model,key_label,status,duration_ms,stream,prompt_tokens,completion_tokens,total_tokens,error,req_content,resp_content,project,effort,thinking_tokens,max_tokens,temperature)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
     pruneStmt = db.prepare("DELETE FROM calls WHERE id NOT IN (SELECT id FROM calls ORDER BY id DESC LIMIT ?)");
     console.log(`[log] call DB ready at ${CALLS_DB}`);
   } catch (e) {
@@ -470,6 +475,46 @@ function extractProject(req, bodyBuf) {
   return String(p || "").trim().toLowerCase().slice(0, 64);
 }
 
+// Pull the model-behaviour knobs out of a request body so the call log shows HOW a
+// call was asked to run, not just which model. Covers both dialects:
+//   OpenAI  → reasoning_effort | reasoning.effort (low/medium/high/...), max_tokens|max_completion_tokens, temperature
+//   Anthropic /v1/messages → thinking.budget_tokens (extended thinking), max_tokens, temperature
+// thinkingTokens: budget when thinking is enabled, 0 when explicitly disabled, null when absent.
+function extractReqParams(bodyBuf) {
+  const out = { effort: null, thinkingTokens: null, maxTokens: null, temperature: null };
+  if (!bodyBuf || !bodyBuf.length) return out;
+  try {
+    const j = JSON.parse(bodyBuf.toString());
+    out.effort = j.reasoning_effort || (j.reasoning && j.reasoning.effort) || null;
+    if (j.thinking && typeof j.thinking === "object") {
+      out.thinkingTokens = j.thinking.type === "enabled"
+        ? (typeof j.thinking.budget_tokens === "number" ? j.thinking.budget_tokens : null)
+        : 0;
+    } else if (typeof j.max_thinking_tokens === "number") {
+      out.thinkingTokens = j.max_thinking_tokens;
+    }
+    const mt = j.max_tokens ?? j.max_completion_tokens;
+    if (typeof mt === "number") out.maxTokens = mt;
+    if (typeof j.temperature === "number") out.temperature = j.temperature;
+  } catch { /* not json */ }
+  return out;
+}
+
+// Normalise a usage block to {prompt_tokens, completion_tokens, total_tokens}. OpenAI already
+// uses those names; anthropic /v1/messages uses {input_tokens, output_tokens} (+ cache_* which
+// count toward input). Passing an unknown shape through is harmless — recordCall reads the three
+// canonical keys and stores null for whatever is missing.
+function normalizeUsage(u) {
+  if (!u || typeof u !== "object") return u;
+  if (u.prompt_tokens != null || u.completion_tokens != null) return u; // already OpenAI-shaped
+  if (u.input_tokens != null || u.output_tokens != null) {
+    const inp = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+    const out = u.output_tokens || 0;
+    return { ...u, prompt_tokens: inp, completion_tokens: out, total_tokens: inp + out };
+  }
+  return u;
+}
+
 // Pull {content, usage} from a finished upstream body (handles SSE streams + plain JSON).
 function extractResponseBody(buf, isStream) {
   const out = { content: null, usage: null };
@@ -477,6 +522,8 @@ function extractResponseBody(buf, isStream) {
   const text = buf.toString();
   if (isStream) {
     let content = "";
+    let rawUsage = null;
+    const mergeUsage = (u) => { if (u && typeof u === "object") rawUsage = { ...(rawUsage || {}), ...u }; };
     for (const line of text.split("\n")) {
       const s = line.trim();
       if (!s.startsWith("data:")) continue;
@@ -484,19 +531,27 @@ function extractResponseBody(buf, isStream) {
       if (!data || data === "[DONE]") continue;
       try {
         const j = JSON.parse(data);
+        // OpenAI chat.completions delta
         const d = j.choices && j.choices[0] && j.choices[0].delta;
         if (d && typeof d.content === "string") content += d.content;
-        if (j.usage) out.usage = j.usage;
+        if (j.usage) mergeUsage(j.usage);
+        // Anthropic /v1/messages events: text in content_block_delta, usage split
+        // across message_start (input) and message_delta (output).
+        if (j.type === "content_block_delta" && j.delta && typeof j.delta.text === "string") content += j.delta.text;
+        if (j.type === "message_start" && j.message && j.message.usage) mergeUsage(j.message.usage);
       } catch { /* partial / non-json chunk */ }
     }
     if (content) out.content = content;
+    if (rawUsage) out.usage = normalizeUsage(rawUsage);
     return out;
   }
   try {
     const j = JSON.parse(text);
-    if (j.usage) out.usage = j.usage;
+    if (j.usage) out.usage = normalizeUsage(j.usage);
     const m = j.choices && j.choices[0] && j.choices[0].message;
     if (m && (m.content || m.reasoning_content)) out.content = m.content || m.reasoning_content;
+    else if (Array.isArray(j.content)) // anthropic /v1/messages: content is an array of blocks
+      out.content = j.content.map((b) => (b && typeof b.text === "string") ? b.text : JSON.stringify(b)).join("");
     else if (Array.isArray(j.output)) out.content = JSON.stringify(j.output); // responses API
     else if (j.error) out.content = JSON.stringify(j.error);
   } catch { /* non-json envelope */ }
@@ -517,6 +572,10 @@ function recordCall(rec) {
       CFG.logging.content ? (rec.reqContent || null) : null,
       CFG.logging.content ? (rec.respContent == null ? null : clip(rec.respContent)) : null,
       rec.project || null,
+      rec.effort || null,
+      rec.thinkingTokens == null ? null : rec.thinkingTokens,
+      rec.maxTokens == null ? null : rec.maxTokens,
+      rec.temperature == null ? null : rec.temperature,
     );
     if (++insertsSincePrune >= 200) { insertsSincePrune = 0; try { pruneStmt.run(CFG.logging.retain); } catch {} }
   } catch (e) { /* never let logging break a request */ }
@@ -767,6 +826,7 @@ async function proxy(req, res, base, opts = {}) {
     reqModel: model || null, lane: lane || "local", sentModel: rewriteModel || model || null,
     keyLabel: keyLabel({ lane: lane || "local", target: opts.target }), stream,
     reqContent: extractRequestContent(bodyBuf), project: project || null,
+    ...extractReqParams(bodyBuf),
   };
   let curTarget = target, curLane = lane;
   let curInit = { method: req.method, headers, redirect: "follow" };
@@ -937,6 +997,7 @@ async function jsonEnforce(req, res, route) {
     reqModel: model || null, lane, sentModel: rewriteModel || model || null,
     keyLabel: keyLabel({ lane, target: route.target }), stream: wantStream,
     reqContent: extractRequestContent(bodyBuf), project: project || null,
+    ...extractReqParams(bodyBuf),
   };
   const logJson = (status, parsed, error) => recordCall({ ...logRec, status, ms: Date.now() - t0,
     usage: parsed && parsed.usage, error,
@@ -1490,7 +1551,7 @@ async function handleAdminApi(req, res, path) {
       const total = db.prepare(`SELECT COUNT(*) n FROM calls ${w}`).get(...params).n;
       // List view: omit big content blobs; send short previews instead.
       const rows = db.prepare(`SELECT id,ts,ip,ua,method,path,req_model,lane,sent_model,key_label,status,duration_ms,stream,
-        prompt_tokens,completion_tokens,total_tokens,error,project,
+        prompt_tokens,completion_tokens,total_tokens,error,project,effort,thinking_tokens,max_tokens,temperature,
         substr(req_content,1,160) AS req_preview, substr(resp_content,1,200) AS resp_preview
         FROM calls ${w} ORDER BY id DESC LIMIT ? OFFSET ?`).all(...params, limit, offset);
       return sendJson(res, 200, { rows, total, limit, offset, dbReady: true });
