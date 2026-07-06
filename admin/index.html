@@ -180,6 +180,7 @@ const NAV = [
   {name:'Overview',slug:'overview',icon:'grid'},
   {name:'Calls',slug:'calls',icon:'list'},
   {name:'Stats',slug:'stats',icon:'chart'},
+  {name:'Accounts',slug:'accounts',icon:'key'},
   {sec:'Control'},
   {name:'Routing',slug:'routing',icon:'route'},
   {name:'Models & test',slug:'models',icon:'box'},
@@ -891,7 +892,36 @@ function CallDrawer({id,onClose}){
 }
 
 /* ───────── shell ───────── */
-const PAGES={overview:Overview,calls:Calls,stats:Stats,routing:Routing,models:Models,crazyrouter:Crazyrouter,secrets:Secrets};
+/* ───────── Accounts: live per-account 5h/7d limits, harvested free off real traffic ───────── */
+function Accounts(){
+  const [rows,setRows]=useState([]); const [now,setNow]=useState(Date.now()); const [err,setErr]=useState('');
+  const load=useCallback(async()=>{ try{ const d=await api('limits'); setRows(d.rows||[]); setNow(d.now||Date.now()); setErr(''); }catch(e){ setErr(e.message||'load failed'); } },[]);
+  useEffect(()=>{ load(); const t=setInterval(load,15000); return ()=>clearInterval(t); },[load]);
+  const pct=v=>v==null?'—':Math.round(v*100)+'%';
+  const cls=v=>v==null?'':v>=0.9?'down':v>=0.7?'warnp':'up';
+  const rel=ts=>{ if(!ts)return '—'; const ms=ts*1000-now; if(ms<=0)return 'now'; const h=ms/3600000; return h>=1?Math.round(h)+'h':Math.max(1,Math.round(ms/60000))+'m'; };
+  const ago=ts=>{ if(!ts)return ''; const m=(now-ts)/60000; return m<1?'just now':m<60?Math.round(m)+'m ago':Math.round(m/60)+'h ago'; };
+  return html`
+  <${PageHead} title="Accounts — live limits"/>
+  <div class="card">
+    <p class="hint" style="margin:0 0 12px">Per-account Anthropic <b>5h</b> / <b>7d</b> headroom, harvested for free off the rate-limit headers of real <span class="pill wrappy">anthropic</span>-lane traffic — <b>zero probe tokens</b>. Keyed by organization id; refreshes every 15s and on each call.</p>
+    ${err?html`<p class="down">${err}</p>`:''}
+    <div style="overflow:auto"><table>
+      <tr><th>project</th><th>org</th><th>5h</th><th>7d</th><th>status</th><th>7d resets in</th><th>model</th><th>last seen</th></tr>
+      ${rows.length? rows.map(r=>html`<tr>
+        <td class="mono"><b>${r.project||'—'}</b></td>
+        <td class="mono hint" title=${r.org_id}>${(r.org_id||'').slice(0,8)}</td>
+        <td><span class="pill ${cls(r.u5)}">${pct(r.u5)}</span></td>
+        <td><span class="pill ${cls(r.u7)}">${pct(r.u7)}</span></td>
+        <td>${(r.s7==='allowed_warning')?html`<span class="warnp">warning</span>`:(r.status||'—')}</td>
+        <td class="mono">${rel(r.reset7)}</td>
+        <td class="mono hint">${r.model||''}</td>
+        <td class="hint">${ago(r.ts)}</td>
+      </tr>`): html`<tr><td colspan="8" class="hint">No anthropic-lane traffic yet — a row appears on the first real call routed to a local-dev project.</td></tr>`}
+    </table></div>
+  </div>`;
+}
+const PAGES={overview:Overview,calls:Calls,stats:Stats,accounts:Accounts,routing:Routing,models:Models,crazyrouter:Crazyrouter,secrets:Secrets};
 function Shell({slug,go,children}){
   const [sbOpen,setSbOpen]=useState(false);
   return html`<div class="shell">
