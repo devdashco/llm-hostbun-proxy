@@ -1606,6 +1606,14 @@ async function handleAdminApi(req, res, path) {
         ROUND(AVG(duration_ms)) avg_ms, SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) errors
         FROM calls WHERE ${W} GROUP BY lane ORDER BY n DESC`).all(since);
       const byKey = db.prepare(`SELECT key_label, COUNT(*) n FROM calls WHERE ${W} GROUP BY key_label ORDER BY n DESC`).all(since);
+      // By client (user-agent) — surfaces who's calling: promopilot=Bun, scripts=Python-urllib, and any
+      // Claude Code / anthropic-sdk clients show up here by their UA. thinkers = calls that sent extended
+      // thinking or a reasoning_effort, so you can spot reasoning traffic per client at a glance.
+      const byClient = db.prepare(`SELECT COALESCE(NULLIF(ua,''),'(none)') ua, COUNT(*) n,
+        COALESCE(SUM(total_tokens),0) tok, MAX(ts) last, COUNT(DISTINCT ip) ips,
+        SUM(CASE WHEN effort IS NOT NULL OR (thinking_tokens IS NOT NULL AND thinking_tokens > 0) THEN 1 ELSE 0 END) thinkers,
+        GROUP_CONCAT(DISTINCT lane) lanes
+        FROM calls WHERE ${W} GROUP BY COALESCE(NULLIF(ua,''),'(none)') ORDER BY n DESC LIMIT 40`).all(since);
       const byModel = db.prepare(`SELECT req_model, lane, COUNT(*) n, COALESCE(SUM(total_tokens),0) tok,
         COALESCE(SUM(prompt_tokens),0) ptok, COALESCE(SUM(completion_tokens),0) ctok, ROUND(AVG(duration_ms)) avg_ms
         FROM calls WHERE ${W} GROUP BY req_model ORDER BY tok DESC LIMIT 40`).all(since);
@@ -1642,7 +1650,7 @@ async function handleAdminApi(req, res, path) {
       const oldest = db.prepare("SELECT MIN(ts) t FROM calls").get().t;
       return sendJson(res, 200, { dbReady: true, window: winKey, total, windowCalls, windowErrors, windowTokens,
         windowPromptTokens, windowCompletionTokens, windowJsonFails, windowCost: +windowCost.toFixed(4),
-        pricedLanes: ["crazyrouter"], byLane, byKey, byModel, byProject, oldest, retain: CFG.logging.retain });
+        pricedLanes: ["crazyrouter"], byLane, byKey, byClient, byModel, byProject, oldest, retain: CFG.logging.retain });
     } catch (e) { return sendJson(res, 500, { error: e.message }); }
   }
 

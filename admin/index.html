@@ -201,6 +201,15 @@ const StatusPill = ({status,error}) => {
 };
 const KV = ({n,children}) => html`<div class="kv"><div class="n">${n}</div><div class="v">${children}</div></div>`;
 const Card = ({cls,children}) => html`<div class="card ${cls||''}">${children}</div>`;
+// Reasoning params surfaced per call: 🧠 effort (low/med/high), 💭 extended-thinking budget (or "off").
+const ParamBadges = ({r}) => {
+  const b=[];
+  if(r.effort) b.push(html`<span class="chip" title="reasoning effort" style="border-color:var(--amb);color:var(--amb)">🧠 ${r.effort}</span>`);
+  if(r.thinking_tokens>0) b.push(html`<span class="chip" title="extended thinking budget (tokens)" style="border-color:var(--acc);color:var(--acc)">💭 ${nfmt(r.thinking_tokens)}</span>`);
+  else if(r.thinking_tokens===0) b.push(html`<span class="chip" title="thinking explicitly disabled">💭 off</span>`);
+  if(!b.length) return '';
+  return html`<span> ${b}</span>`;
+};
 
 /* ───────── stacked-bar time chart ───────── */
 const METRIC_LABEL = {tok:'tokens',n:'calls',err:'errors'};
@@ -355,9 +364,9 @@ function Calls(){
     Object.entries(f).forEach(([k,v])=>{ if(v&&v.trim())p.set(k,v.trim()); });
     try{ const d=await api('calls?'+p.toString()); setRows(d.rows||[]); setMeta(d.dbReady===false?'call DB unavailable':`${(d.rows||[]).length} shown of ${d.total} total`); }catch(e){}
   },[f]);
-  useEffect(()=>{ // seed project filter from ?project on first mount
-    const q=new URLSearchParams(window.location.search); const pr=q.get('project');
-    if(pr){ setF(x=>({...x,project:pr})); }
+  useEffect(()=>{ // seed project / q filter from URL on mount (set by Stats drilldowns)
+    const sp=new URLSearchParams(window.location.search); const pr=sp.get('project'), qq=sp.get('q');
+    if(pr||qq){ setF(x=>({...x,project:pr||'',q:qq||''})); }
   },[]);
   useEffect(()=>{load();},[load]);
   const upd=(k,v)=>setF(x=>({...x,[k]:v}));
@@ -381,7 +390,7 @@ function Calls(){
     ${rows.map(r=>html`<tr class="click" onClick=${()=>openCall(r.id)}>
       <td class="mono" style="font-size:12px;white-space:nowrap">${fmtTime(r.ts)}</td>
       <td style="font-size:12px">${r.project?html`<span class="pill" style="background:#2a3a2a;color:#8bc88b">${r.project}</span>`:html`<span class="mut" style="font-size:11px">(none)</span>`}</td>
-      <td class="mono" style="font-size:12px">${r.req_model||'-'}${r.sent_model&&r.sent_model!==r.req_model?html` <span class="mut">→ ${r.sent_model}</span>`:''}${r.stream?html` <span class="mut">≈stream</span>`:''}</td>
+      <td class="mono" style="font-size:12px">${r.req_model||'-'}${r.sent_model&&r.sent_model!==r.req_model?html` <span class="mut">→ ${r.sent_model}</span>`:''}${r.stream?html` <span class="mut">≈stream</span>`:''}<${ParamBadges} r=${r}/></td>
       <td><${LanePill} lane=${r.lane}/></td>
       <td class="mono" style="font-size:12px">${r.key_label||''}</td>
       <td><${StatusPill} status=${r.status} error=${r.error}/></td>
@@ -404,7 +413,7 @@ function Calls(){
 /* ───────── STATS ───────── */
 const WIN_ITEMS=[['15m','Last 15 min'],['1h','Last hour'],['6h','Last 6h'],['24h','Last 24h'],['7d','Last 7d'],['30d','Last 30d'],['all','All time']];
 function Stats(){
-  const {go,setCallsProject} = useApp();
+  const {go,gotoCalls} = useApp();
   const [win,setWin]=useState('24h');
   const [s,setS]=useState(null);
   const [series,setSeries]=useState(null);
@@ -449,7 +458,20 @@ function Stats(){
   </${Card}>
   <${Card}>
     <h3>By project <small class="hint">— click a row to see its calls. <code>(none)</code> = no <code>X-Project</code> header.</small></h3>
-    <div style="overflow:auto">${ProjectTable({s,sort,setSort,go,setCallsProject})}</div>
+    <div style="overflow:auto">${ProjectTable({s,sort,setSort,gotoCalls})}</div>
+  </${Card}>
+  <${Card}>
+    <h3>By client <small class="hint">— who's calling (user-agent). <b style="color:var(--amb)">🧠 thinkers</b> = calls that used reasoning effort / extended thinking. Claude Code shows up as <code>claude-cli/…</code>. Click a row to filter the call log.</small></h3>
+    <div style="overflow:auto"><table>
+      <tr><th>client · user-agent</th><th>calls</th><th>tokens</th><th>🧠 thinkers</th><th>IPs</th><th>lanes</th><th>last</th></tr>
+      ${(s.byClient||[]).map(r=>html`<tr class="click" onClick=${()=>gotoCalls({q:r.ua})}>
+        <td class="mono" style="font-size:12px">${r.ua}</td>
+        <td class="mono">${r.n}</td><td class="mono">${(r.tok||0).toLocaleString()}</td>
+        <td class="mono" style=${r.thinkers>0?'color:var(--amb);font-weight:700':'color:var(--mut)'}>${r.thinkers||0}</td>
+        <td class="mono">${r.ips}</td><td style="font-size:11px">${String(r.lanes||'').split(',').join(' ')}</td>
+        <td class="mono mut" style="font-size:11px">${ago(r.last)}</td>
+      </tr>`)}
+    </table></div>
   </${Card}>
   <${Card}>
     <h3>By model</h3>
@@ -468,7 +490,7 @@ function Stats(){
   </div>
   `}`;
 }
-function ProjectTable({s,sort,setSort,go,setCallsProject}){
+function ProjectTable({s,sort,setSort,gotoCalls}){
   const rows=[...(s.byProject||[])]; const maxT=Math.max(1,...rows.map(r=>r.tok||0));
   const k=sort.key,d=sort.dir;
   rows.sort((a,b)=>{ let x,y;
@@ -483,7 +505,7 @@ function ProjectTable({s,sort,setSort,go,setCallsProject}){
     ${rows.map(r=>{ const errPct=r.n>0?(r.errors/r.n*100):0; const share=r.tok/maxT*100;
       let badge=null; if(r.limit&&r.limitPct!=null){ const sp=r.limit.slowPct||95; const col=r.limitPct>=100?'var(--red)':r.limitPct>=sp?'var(--amb)':'#22c55e'; const cap=r.limit.tokens>0?nfmt(r.limit.tokens)+' tok':r.limit.calls>0?r.limit.calls+' calls':'';
         badge=html` <span class="chip" title=${r.limitPct+'% of '+cap+'/'+r.limit.window+' · at 100%: '+r.limit.hard} style="color:${col};border-color:${col}">${r.limitPct}% ${r.limit.hard==='block'?'🚫':r.limit.hard==='slow'?'🐢':'⚠'}</span>`; }
-      return html`<tr class="click" onClick=${()=>{ setCallsProject((r.project&&r.project!=='(none)')?r.project:''); go('calls'); }}>
+      return html`<tr class="click" onClick=${()=>gotoCalls({project:(r.project&&r.project!=='(none)')?r.project:''})}>
         <td class="mono" style="font-size:12px">${r.project||'(none)'}${badge}</td>
         <td class="mono">${r.n}</td><td class="mono">${(r.tok||0).toLocaleString()}</td>
         <td class="mono mut" style="font-size:12px">${nfmt(r.ptok)} → ${nfmt(r.ctok)}</td>
@@ -827,12 +849,16 @@ function CallDrawer({id,onClose}){
         <${KV} n="latency">${fmtMs(c.duration_ms)}<//>
         <${KV} n="stream">${c.stream?'yes':'no'}<//>
         <${KV} n="tokens">${c.prompt_tokens??'?'} → ${c.completion_tokens??'?'} <span class="mut">(${c.total_tokens??'?'})</span><//>
+        <${KV} n="effort">${c.effort?html`<span style="color:var(--amb)">🧠 ${c.effort}</span>`:'—'}<//>
+        <${KV} n="thinking">${c.thinking_tokens==null?'—':c.thinking_tokens===0?'off':html`<span style="color:var(--acc)">💭 ${nfmt(c.thinking_tokens)} tok</span>`}<//>
+        <${KV} n="max tokens">${c.max_tokens?nfmt(c.max_tokens):'—'}<//>
+        <${KV} n="temperature">${c.temperature==null?'—':c.temperature}<//>
         <${KV} n="ip">${c.ip||'—'}<//>
       </div></div>
       ${c.error&&html`<div class="dsec"><div class="dlbl" style="color:var(--red)">error</div><div class="msgbox" style="color:var(--red)">${c.error}</div></div>`}
       <div class="dsec"><div class="dlbl">prompt</div><div class="msgbox">${c.req_content||'(not stored)'}</div></div>
       <div class="dsec"><div class="dlbl">reply</div><div class="msgbox">${c.resp_content||'(not stored)'}</div></div>
-      ${c.ua&&html`<div class="dsec"><div class="dlbl">user agent</div><div class="msgbox" style="max-height:none">${c.ua}</div></div>`}
+      ${c.ua&&html`<div class="dsec"><div class="dlbl">client · user-agent</div><div class="msgbox" style="max-height:none">${c.ua}</div></div>`}
       `}
     </div>
   </aside>`;
@@ -886,7 +912,6 @@ function App(){
   const [state,setState]=useState(null);
   const [slug,setSlug]=useState(()=>{ let s=location.pathname.replace(BASE,'').replace(/^\/+/,'').split('/')[0]||'overview'; return NAV.some(x=>x.slug===s)?s:'overview'; });
   const [callId,setCallId]=useState(null);
-  const callsProjectRef=useRef('');
   const boot=useCallback(async()=>{ try{ const s=await api('state'); setState(s); setAuthed(true); }catch(e){ setAuthed(false); } },[]);
   useEffect(()=>{ onUnauth=()=>setAuthed(false); boot(); },[boot]);
   useEffect(()=>{ const h=()=>{ let s=location.pathname.replace(BASE,'').replace(/^\/+/,'').split('/')[0]||'overview'; setSlug(NAV.some(x=>x.slug===s)?s:'overview'); }; window.addEventListener('popstate',h); return ()=>window.removeEventListener('popstate',h); },[]);
@@ -898,7 +923,9 @@ function App(){
   if(!authed) return html`<${Login} onOk=${boot}/>`;
   if(!state) return html`<div class="mut" style="padding:40px;text-align:center">loading…</div>`;
   const Page=PAGES[slug]||Overview;
-  const ctx={ state, reload, go, openCall:setCallId, setCallsProject:v=>{callsProjectRef.current=v; try{const u=new URL(location.href);u.searchParams.set('project',v);history.replaceState({},'',u);}catch{}}, callsProjectRef };
+  // gotoCalls: drill into the call log with a filter (project= or q=). Calls remounts on nav and reads these.
+  const gotoCalls=(params)=>{ try{ const u=new URL(location.href); u.searchParams.delete('project'); u.searchParams.delete('q'); Object.entries(params||{}).forEach(([k,v])=>{ if(v) u.searchParams.set(k,v); }); history.replaceState({},'',u); }catch{} go('calls'); };
+  const ctx={ state, reload, go, openCall:setCallId, gotoCalls };
   return html`<${Ctx.Provider} value=${ctx}>
     <${Shell} slug=${slug} go=${go}><${Page}/></${Shell}>
     <${CallDrawer} id=${callId} onClose=${()=>setCallId(null)}/>
