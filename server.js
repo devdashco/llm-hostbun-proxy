@@ -1700,7 +1700,8 @@ const server = http.createServer(async (req, res) => {
 
   // Admin (only on the main host, never docs.*)
   if (!host.startsWith("docs.")) {
-    if (path === "/admin" || path === "/admin/") return sendFile(res, ADMIN_FILE, "text/html; charset=utf-8", false);
+    // main page IS the admin panel — root serves it directly (no need to type /admin)
+    if (path === "/" || path === "/admin" || path === "/admin/") return sendFile(res, ADMIN_FILE, "text/html; charset=utf-8", false);
     if (path.startsWith("/admin/api/")) return handleAdminApi(req, res, path);
     if (path.startsWith("/admin/")) return sendFile(res, ADMIN_FILE, "text/html; charset=utf-8", false);
   }
