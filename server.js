@@ -1652,6 +1652,7 @@ async function handleAdminApi(req, res, path) {
     if (patch.modelRoutes) next.modelRoutes = patch.modelRoutes;
     if (patch.projectRoutes) next.projectRoutes = patch.projectRoutes;
     if (patch.projectGroups) next.projectGroups = patch.projectGroups;
+    if (Array.isArray(patch.anthropicPool)) next.anthropicPool = patch.anthropicPool;   // Max-token rotation pool
     if (patch.projectLimits) next.projectLimits = patch.projectLimits;
     if (patch.projectLimitDefault) next.projectLimitDefault = patch.projectLimitDefault;
     if (patch.cloudPolicy) next.cloudPolicy = patch.cloudPolicy;
