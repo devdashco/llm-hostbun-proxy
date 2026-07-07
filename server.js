@@ -1574,7 +1574,7 @@ function throttled(ip) {
   rec.n++;
   loginHits.set(ip, rec);
   if (loginHits.size > 5000) loginHits.clear();
-  return rec.n > 10;
+  return rec.n > 30;   // fleet shares one egress IP; cccc now caches the cookie so real logins are rare
 }
 
 function adminState() {
