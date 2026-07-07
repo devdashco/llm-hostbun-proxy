@@ -450,7 +450,8 @@ function initDb() {
       prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER,
       error TEXT, req_content TEXT, resp_content TEXT, project TEXT,
       effort TEXT, thinking_tokens INTEGER, max_tokens INTEGER, temperature REAL,
-      user_id TEXT, cache_read INTEGER, cache_write INTEGER, stop_reason TEXT
+      user_id TEXT, cache_read INTEGER, cache_write INTEGER, stop_reason TEXT,
+      tool_count INTEGER, mcp_tools INTEGER, tool_servers TEXT, tools_kb INTEGER, msg_count INTEGER, system_kb INTEGER
     );`);
     // Migrate older DBs that predate later columns (each idempotent — throws if it already exists).
     try { db.exec("ALTER TABLE calls ADD COLUMN project TEXT;"); } catch { /* already there */ }
@@ -463,6 +464,13 @@ function initDb() {
     try { db.exec("ALTER TABLE calls ADD COLUMN user_id TEXT;"); } catch { /* already there */ }
     try { db.exec("ALTER TABLE calls ADD COLUMN cache_read INTEGER;"); } catch { /* already there */ }
     try { db.exec("ALTER TABLE calls ADD COLUMN cache_write INTEGER;"); } catch { /* already there */ }
+    // per-request shape metrics: enabled tools / MCP servers / tool-schema tax / convo length
+    try { db.exec("ALTER TABLE calls ADD COLUMN tool_count INTEGER;"); } catch { /* already there */ }
+    try { db.exec("ALTER TABLE calls ADD COLUMN mcp_tools INTEGER;"); } catch { /* already there */ }
+    try { db.exec("ALTER TABLE calls ADD COLUMN tool_servers TEXT;"); } catch { /* already there */ }
+    try { db.exec("ALTER TABLE calls ADD COLUMN tools_kb INTEGER;"); } catch { /* already there */ }
+    try { db.exec("ALTER TABLE calls ADD COLUMN msg_count INTEGER;"); } catch { /* already there */ }
+    try { db.exec("ALTER TABLE calls ADD COLUMN system_kb INTEGER;"); } catch { /* already there */ }
     try { db.exec("ALTER TABLE calls ADD COLUMN stop_reason TEXT;"); } catch { /* already there */ }
     db.exec("CREATE INDEX IF NOT EXISTS idx_calls_ts ON calls(ts);");
     db.exec("CREATE INDEX IF NOT EXISTS idx_calls_model ON calls(req_model);");
@@ -471,8 +479,8 @@ function initDb() {
     db.exec("CREATE INDEX IF NOT EXISTS idx_calls_project_ts ON calls(project, ts);"); // per-project usage windows
     try { db.exec("CREATE INDEX IF NOT EXISTS idx_calls_user ON calls(user_id);"); } catch { /* col may not exist on very old dbs mid-migrate */ }
     insertStmt = db.prepare(`INSERT INTO calls
-      (ts,ip,ua,method,path,req_model,lane,sent_model,key_label,status,duration_ms,stream,prompt_tokens,completion_tokens,total_tokens,error,req_content,resp_content,project,effort,thinking_tokens,max_tokens,temperature,user_id,cache_read,cache_write,stop_reason)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      (ts,ip,ua,method,path,req_model,lane,sent_model,key_label,status,duration_ms,stream,prompt_tokens,completion_tokens,total_tokens,error,req_content,resp_content,project,effort,thinking_tokens,max_tokens,temperature,user_id,cache_read,cache_write,stop_reason,tool_count,mcp_tools,tool_servers,tools_kb,msg_count,system_kb)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
     // Retention prunes the oldest NON-dev rows only — local-dev (anthropic lane) chats are exempt and
     // kept forever, so a burst of prod traffic can never evict your saved Claude Code conversations.
     pruneStmt = db.prepare("DELETE FROM calls WHERE lane != 'anthropic' AND id NOT IN (SELECT id FROM calls WHERE lane != 'anthropic' ORDER BY id DESC LIMIT ?)");
@@ -530,10 +538,33 @@ function wrappyAccountLabel(lane, upHeaders) {
 // so the full-save is the conversation (system+messages+response), not a megabyte of tool specs.
 function toolsSummary(tools) {
   if (!Array.isArray(tools) || !tools.length) return null;
-  const names = tools.map((t) => t && t.name).filter(Boolean);
+  // handle both dialects: Anthropic {name,...} and OpenAI {type:"function",function:{name}}
+  const names = tools.map((t) => t && (t.name || (t.function && t.function.name))).filter(Boolean);
   const mcp = names.filter((n) => n.startsWith("mcp__"));
   const servers = [...new Set(mcp.map((n) => n.split("__")[1]).filter(Boolean))].sort();
   return { count: names.length, mcp: mcp.length, builtin: names.length - mcp.length, servers };
+}
+
+// Per-request SHAPE metrics for the call log — answers "what's loaded into this
+// conversation and how big is it": how many tools (and how many are MCP), which MCP
+// servers, the tool-schema tax in KB (the ~350K-token sink), the conversation length
+// (message count), and the system-prompt size. Fail-safe: nulls on any parse issue.
+function extractReqMeta(bodyBuf) {
+  const out = { toolCount: null, mcpTools: null, toolServers: null, toolsKb: null, msgCount: null, systemKb: null };
+  if (!bodyBuf || !bodyBuf.length) return out;
+  try {
+    const j = JSON.parse(bodyBuf.toString());
+    if (Array.isArray(j.tools) && j.tools.length) {
+      const s = toolsSummary(j.tools);
+      out.toolCount = s.count;
+      out.mcpTools = s.mcp;
+      out.toolServers = (s.servers || []).join(",") || null;
+      out.toolsKb = Math.round(JSON.stringify(j.tools).length / 1024);
+    }
+    if (Array.isArray(j.messages)) out.msgCount = j.messages.length;
+    if (j.system != null) out.systemKb = Math.round(JSON.stringify(j.system).length / 1024);
+  } catch { /* not json */ }
+  return out;
 }
 
 function extractRequestContent(bodyBuf, full) {
@@ -714,6 +745,12 @@ function recordCall(rec) {
       u.cache_read_input_tokens == null ? null : u.cache_read_input_tokens,
       u.cache_creation_input_tokens == null ? null : u.cache_creation_input_tokens,
       rec.stopReason || null,
+      rec.toolCount == null ? null : rec.toolCount,
+      rec.mcpTools == null ? null : rec.mcpTools,
+      rec.toolServers || null,
+      rec.toolsKb == null ? null : rec.toolsKb,
+      rec.msgCount == null ? null : rec.msgCount,
+      rec.systemKb == null ? null : rec.systemKb,
     );
     if (++insertsSincePrune >= 200) { insertsSincePrune = 0; try { pruneStmt.run(CFG.logging.retain); } catch {} }
   } catch (e) { /* never let logging break a request */ }
@@ -973,6 +1010,7 @@ async function proxy(req, res, base, opts = {}) {
     keyLabel: opts.account ? `anthropic:${opts.account}` : keyLabel({ lane: lane || "local", target: opts.target }), stream, full: fullContent,
     reqContent: extractRequestContent(bodyBuf, fullContent), project: project || null,
     ...extractReqParams(bodyBuf),
+    ...extractReqMeta(bodyBuf),
   };
   let curTarget = target, curLane = lane;
   let curInit = { method: req.method, headers, redirect: "follow" };
@@ -1168,6 +1206,7 @@ async function jsonEnforce(req, res, route) {
     keyLabel: keyLabel({ lane, target: route.target }), stream: wantStream,
     reqContent: extractRequestContent(bodyBuf), project: project || null,
     ...extractReqParams(bodyBuf),
+    ...extractReqMeta(bodyBuf),
   };
   const logJson = (status, parsed, error) => recordCall({ ...logRec, status, ms: Date.now() - t0,
     usage: parsed && parsed.usage, error,
@@ -1789,6 +1828,7 @@ async function handleAdminApi(req, res, path) {
       const rows = db.prepare(`SELECT id,ts,ip,ua,method,path,req_model,lane,sent_model,key_label,status,duration_ms,stream,
         prompt_tokens,completion_tokens,total_tokens,error,project,effort,thinking_tokens,max_tokens,temperature,
         user_id,cache_read,cache_write,stop_reason,
+        tool_count,mcp_tools,tool_servers,tools_kb,msg_count,system_kb,
         substr(req_content,1,160) AS req_preview, substr(resp_content,1,200) AS resp_preview
         FROM calls ${w} ORDER BY id DESC LIMIT ? OFFSET ?`).all(...params, limit, offset);
       return sendJson(res, 200, { rows, total, limit, offset, dbReady: true });
@@ -1802,6 +1842,33 @@ async function handleAdminApi(req, res, path) {
     try {
       const row = db.prepare("SELECT * FROM calls WHERE id = ?").get(id);
       return row ? sendJson(res, 200, row) : sendJson(res, 404, { error: "not found" });
+    } catch (e) { return sendJson(res, 500, { error: e.message }); }
+  }
+  // Per-CONVERSATION view: group the log by Claude session_id and surface what's loaded
+  // into each chat — MCP servers + tool count, the tool-schema tax (KB), conversation
+  // length (messages), token spend, and the account it billed. Answers "which MCP tools
+  // is this convo carrying and how long is it". anthropic lane (Claude Code) only.
+  if (sub === "conversations" && req.method === "GET") {
+    if (!db) return sendJson(res, 404, { error: "no db" });
+    const q = url.parse(req.url, true).query;
+    const limit = Math.min(parseInt(q.limit, 10) || 50, 500);
+    try {
+      const rows = db.prepare(`
+        SELECT json_extract(user_id,'$.session_id') AS session,
+          MAX(project) AS consumer, MAX(key_label) AS account,
+          COUNT(*) AS calls, MAX(msg_count) AS msgs,
+          MAX(tool_count) AS tools, MAX(mcp_tools) AS mcp_tools,
+          MAX(tools_kb) AS tools_kb, MAX(system_kb) AS system_kb,
+          SUM(total_tokens) AS tokens, SUM(cache_read) AS cache_read,
+          MIN(ts) AS first_ts, MAX(ts) AS last_ts,
+          SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) AS errors
+        FROM calls
+        WHERE lane='anthropic' AND json_extract(user_id,'$.session_id') IS NOT NULL
+        GROUP BY session ORDER BY last_ts DESC LIMIT ?`).all(limit);
+      const srv = db.prepare(`SELECT tool_servers FROM calls
+        WHERE json_extract(user_id,'$.session_id')=? ORDER BY id DESC LIMIT 1`);
+      for (const r of rows) { try { r.servers = (srv.get(r.session) || {}).tool_servers || null; } catch { r.servers = null; } }
+      return sendJson(res, 200, { conversations: rows, count: rows.length });
     } catch (e) { return sendJson(res, 500, { error: e.message }); }
   }
   // Full-content export for the NAS archiver (ops/nas-shipper). Cursor by id,
