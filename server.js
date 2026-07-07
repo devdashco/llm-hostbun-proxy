@@ -1855,7 +1855,7 @@ async function handleAdminApi(req, res, path) {
     try {
       const rows = db.prepare(`
         SELECT json_extract(user_id,'$.session_id') AS session,
-          MAX(project) AS consumer, MAX(key_label) AS account,
+          MAX(project) AS consumer,
           COUNT(*) AS calls, MAX(msg_count) AS msgs,
           MAX(tool_count) AS tools, MAX(mcp_tools) AS mcp_tools,
           MAX(tools_kb) AS tools_kb, MAX(system_kb) AS system_kb,
@@ -1865,9 +1865,14 @@ async function handleAdminApi(req, res, path) {
         FROM calls
         WHERE lane='anthropic' AND json_extract(user_id,'$.session_id') IS NOT NULL
         GROUP BY session ORDER BY last_ts DESC LIMIT ?`).all(limit);
-      const srv = db.prepare(`SELECT tool_servers FROM calls
+      // latest row per session for the fields that CHANGE over a conversation's life
+      // (the current account it bills + the current MCP server set) — not a lexical MAX.
+      const latest = db.prepare(`SELECT key_label, tool_servers FROM calls
         WHERE json_extract(user_id,'$.session_id')=? ORDER BY id DESC LIMIT 1`);
-      for (const r of rows) { try { r.servers = (srv.get(r.session) || {}).tool_servers || null; } catch { r.servers = null; } }
+      for (const r of rows) {
+        try { const l = latest.get(r.session) || {}; r.account = l.key_label || null; r.servers = l.tool_servers || null; }
+        catch { r.account = null; r.servers = null; }
+      }
       return sendJson(res, 200, { conversations: rows, count: rows.length });
     } catch (e) { return sendJson(res, 500, { error: e.message }); }
   }
