@@ -656,6 +656,33 @@ function RuleSelect({cur,onChange}){
     ${PROJ_MODELS.map(p=>{const v=`${p.provider}|${p.model}`; return html`<option value=${v}>${p.provider}: ${p.model}</option>`;})}
   </select>`;
 }
+/* Allowlist editor. Independent of the pin: the pin rewrites, the allowlist only refuses.
+   Empty = no restriction (never "nothing allowed"). Edits the same rule object the pin lives in. */
+function AllowCell({cur,models,onChange}){
+  const [open,setOpen]=useState(false);
+  const ap=(cur&&cur.allowProviders)||[], am=(cur&&cur.allowModels)||[];
+  const blocked=cur&&cur.block;
+  const emit=patch=>{ const next={...(cur||{}),...patch};
+    ['allowProviders','allowModels'].forEach(k=>{ if(!next[k]||!next[k].length) delete next[k]; });
+    onChange((next.provider||next.block||next.allowProviders||next.allowModels)?next:null); };
+  const toggleP=p=>emit({allowProviders:ap.includes(p)?ap.filter(x=>x!==p):[...ap,p]});
+  const summary=blocked?'—':(!ap.length&&!am.length)?'any':[ap.length&&`${ap.length} provider${ap.length>1?'s':''}`,am.length&&`${am.length} model${am.length>1?'s':''}`].filter(Boolean).join(' · ');
+  if(blocked) return html`<span class="hint">blocked — nothing runs</span>`;
+  return html`<div>
+    <button class="ghost" style="font-size:12px" onClick=${()=>setOpen(!open)}>${open?'▾':'▸'} ${summary}</button>
+    ${open&&html`<div style="margin-top:6px;padding:8px;border:1px solid var(--bd,#333);border-radius:6px;min-width:220px">
+      <div style="display:flex;gap:14px;flex-wrap:wrap">
+        ${['claudecode','crazyrouter','local'].map(p=>html`<label style="font-size:12px;display:inline-flex;gap:5px;align-items:center;white-space:nowrap">
+          <input type="checkbox" style="width:auto;margin:0;flex:0 0 auto" checked=${ap.includes(p)} onChange=${()=>toggleP(p)}/>${p}</label>`)}
+      </div>
+      <input class="mono" style="width:100%;margin-top:8px;font-size:12px;box-sizing:border-box" placeholder="allowed model ids, comma-sep — empty = any"
+        value=${am.join(', ')} onChange=${e=>emit({allowModels:e.target.value.split(',').map(x=>x.trim().toLowerCase()).filter(Boolean)})}
+        list="allow-models"/>
+      <datalist id="allow-models">${models.map(m=>html`<option value=${m}/>`)}</datalist>
+      <small class="hint">Empty = no restriction. A call that resolves outside the list is rejected, never rewritten.</small>
+    </div>`}
+  </div>`;
+}
 const LIM_WINDOWS=['1h','6h','24h','7d','30d'];
 const LIM_HARD=[['block','🚫 block 429'],['slow','🐢 slow only'],['warn','⚠ warn only']];
 function Routing(){
@@ -674,7 +701,15 @@ function Routing(){
     defaultRoute:clone(s.defaultRoute) }; }
   const set=(k,v)=>setD(x=>({...x,[k]:v}));
   const matchGroup=pkey=>{ const p=String(pkey||'').toLowerCase(); for(const g of d.projectGroups||[]) for(const pre of g.prefixes||[]) if(p===pre||p.startsWith(pre)) return g; return null; };
-  const projNames=[...new Set([...known,...Object.keys(d.projectRoutes||{})].filter(p=>p&&p!=='(none)'))].sort();
+  // Every REGISTERED consumer, plus anything the log has seen, plus anything already ruled. Seen
+  // names are collapsed to the consumer (before the ':') — a rule resolves at consumer level, so
+  // listing one row per job invited a pin on `promopilot:generatetext` that covers nothing else.
+  const registered=Object.keys(state.consumers||{});
+  const projNames=[...new Set([...registered,...known.map(p=>String(p).split(':')[0]),...Object.keys(d.projectRoutes||{})]
+    .filter(p=>p&&p!=='(none)'))].sort();
+  const seenSet=new Set(known.map(p=>String(p).split(':')[0]));
+  const allModels=[...new Set([...(state.claudecodeModels||[]),...Object.values(state.localMap||{}),...(state.gatedModels||[]),
+    ...PROJ_MODELS.map(p=>p.model)])].sort();
 
   async function save(){
     const patch={ bases:d.bases, localMap:d.localMap, modelRoutes:d.modelRoutes, projectRoutes:d.projectRoutes, projectGroups:d.projectGroups,
@@ -698,13 +733,21 @@ function Routing(){
   return html`
   <${PageHead} title="Routing & flow control"/>
   <${Card} cls="acc">
-    <h3 style="font-size:16px">🎯 Per-project model <small class="hint">— pick a model per app. <b>Auto</b> = normal routing. <b>🚫 Block</b> = reject. Beats groups + everything below.</small></h3>
-    <table><tr><th style="width:40%">Project</th><th>Model</th></tr>
-      ${projNames.length?projNames.map(k=>{ const cur=d.projectRoutes[k]; const grp=cur?null:matchGroup(k);
-        const pill=cur?html`<${RulePill} cur=${cur}/>`:(grp?html`<span class="pill ${grp.block?'down':(providerCls[grp.provider]||'')}" title=${'from group '+grp.name}>${grp.block?'🚫':grp.provider} ·grp</span>`:html`<${RulePill} cur=${null}/>`);
-        return html`<tr><td class="mono">${k}</td><td><div class="flex"><span style="flex:0 0 96px">${pill}</span>
-          <${RuleSelect} cur=${cur} onChange=${rule=>{ const pr=clone(d.projectRoutes); if(!rule)delete pr[k]; else pr[k]=rule; set('projectRoutes',pr); }}/></div></td></tr>`;
-      }):html`<tr><td colspan="2" class="mut">no projects seen yet — they appear once apps send an X-Project header</td></tr>`}
+    <h3 style="font-size:16px">🎯 Per-project model <small class="hint">— <b>Model</b> pins (rewrites). <b>Allowed</b> restricts (rejects). <b>Auto</b> = normal routing, <b>🚫 Block</b> = reject all. A rule also covers that consumer's jobs (<span class="mono">name:job</span>). Beats groups + everything below.</small></h3>
+    <table><tr><th style="width:32%">Project</th><th style="width:40%">Model (pin)</th><th>Allowed (providers / models)</th></tr>
+      ${projNames.length?projNames.map(k=>{ const cur=d.projectRoutes[k]; const grp=(cur&&(cur.provider||cur.block))?null:matchGroup(k);
+        const pill=(cur&&(cur.provider||cur.block))?html`<${RulePill} cur=${cur}/>`:(grp?html`<span class="pill ${grp.block?'down':(providerCls[grp.provider]||'')}" title=${'from group '+grp.name}>${grp.block?'🚫':grp.provider} ·grp</span>`:html`<${RulePill} cur=${null}/>`);
+        const setRule=rule=>{ const pr=clone(d.projectRoutes); if(!rule)delete pr[k]; else pr[k]=rule; set('projectRoutes',pr); };
+        return html`<tr><td class="mono">${k}
+            ${!state.consumers?.[k]&&html` <span class="chip" title="seen in the call log but not in the consumer registry">unregistered</span>`}
+            ${!seenSet.has(k)&&html` <span class="chip mut" title="registered, no traffic yet">idle</span>`}</td>
+          <td><div class="flex"><span style="flex:0 0 96px">${pill}</span>
+          ${/* keep any allowlist when the pin changes — they are separate axes of the same rule */''}
+          <${RuleSelect} cur=${(cur&&(cur.provider||cur.block))?cur:null} onChange=${rule=>{
+            const keep=cur?{...(cur.allowProviders?{allowProviders:cur.allowProviders}:{}),...(cur.allowModels?{allowModels:cur.allowModels}:{})}:{};
+            const next=rule?{...rule,...(rule.block?{}:keep)}:(Object.keys(keep).length?keep:null); setRule(next); }}/></div></td>
+          <td><${AllowCell} cur=${cur} models=${allModels} onChange=${setRule}/></td></tr>`;
+      }):html`<tr><td colspan="3" class="mut">no projects seen yet — they appear once apps send an X-Project header</td></tr>`}
     </table>
   </${Card}>
 

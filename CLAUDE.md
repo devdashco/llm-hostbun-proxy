@@ -43,6 +43,34 @@ and the retention prune must match **both**.
 Routing lives in a mutable `CFG` seeded from env, overlaid with `/data/config.json` on a persistent
 volume, editable live from the panel at `/`. Changes apply without a redeploy.
 
+### Per-project rules — pin vs allowlist
+
+`projectRoutes[<consumer>]` (and each `projectGroups[]` entry) carries **two independent axes**, and
+they are not the same thing:
+
+| field | what it does | on mismatch |
+|---|---|---|
+| `provider` + `model` | the **pin** — rewrites the request | n/a |
+| `allowProviders` / `allowModels` | the **allowlist** — restricts where it may resolve | `400 blocked`, never a substitution |
+
+A rule may carry either, both, or neither (neither = the entry is dropped). An empty or absent list
+means *no restriction*, never "nothing allowed" — the opposite makes a mistyped save an outage.
+The allowlist **refuses, never rewrites**: silently serving an allowed model instead is exactly the
+cross-provider substitution invariant 2 forbids.
+
+**A rule is resolved like `accountFor()`: exact path → consumer → group.** So a rule on `promopilot`
+covers `promopilot:generatetext`. Before 2026-07-09 `projectRoutes` matched the literal string only,
+so every job path silently ignored its own project's pin and fell through to the group (or to
+crazyrouter, per token). Pinned model ids are **not** validated against the catalog — Anthropic ships
+ids without asking; that is `claudecodeModels`' job, not this one.
+
+Edit **one** rule with `POST /admin/api/routes {project, …}` — it merges. `POST config` assigns
+`projectRoutes` wholesale and a save built from a stale render deletes every other project's rule
+(same hazard as `pins`, same door).
+
+**None of this lives in Postgres.** Postgres holds the *call log* and nothing else. Every rule, pin,
+consumer, key hash and account token is a key in `/data/config.json` on the app's volume.
+
 ## Invariants — do not "improve" these away
 
 These are load-bearing decisions, not oversights. Each one was a bug once.
@@ -239,7 +267,8 @@ dependency, the lockfile must be committed or the build fails.
   `anthropic:philip` / `wrappy:philip`, current ones say `claudecode:philip`. `GET /admin/api/accounts`
   uses `split_part(key_label,':',2)` for exactly this reason.
 - **`POST /admin/api/config` REPLACES `projectAccounts`.** Sending one pin deletes the rest. Use
-  `POST /admin/api/pins {project,account}` — it merges, and rejects an unknown account name.
+  `POST /admin/api/pins {project,account}` — it merges, and rejects an unknown account name. Same for
+  `projectRoutes` → `POST /admin/api/routes {project,…}`.
 - **Renaming a field renames it in SQL too.** The `lane`→`provider` rename needed an
   `ALTER TABLE calls ADD COLUMN provider` + backfill from `lane`; without it `CREATE TABLE IF NOT
   EXISTS` no-ops on the existing prod table, the provider index throws, `initDb()` catches, and

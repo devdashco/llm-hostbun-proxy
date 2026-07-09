@@ -149,7 +149,35 @@ function normProvider(l) {
 // the rename. Read both — dropping the legacy key silently empties modelRoutes/projectRoutes on boot.
 const providerOf = (v) => normProvider(v && (v.provider || v.lane));
 
-const LIMIT_WINDOWS = ["1h", "6h", "24h", "7d", "30d"];
+// A project rule carries two INDEPENDENT things, and conflating them is how "pin promopilot to haiku"
+// turned into "promopilot may only ever use haiku" by accident:
+//   • the PIN     — {provider, model}: what the request is rewritten to, regardless of what it asked for.
+//   • the ALLOWLIST — {allowProviders, allowModels}: what the request may resolve to. Never rewrites;
+//     only refuses. An empty/absent list means "no restriction", never "nothing allowed" — the
+//     alternative would turn a typo'd save into a total outage for that project.
+// A rule may have either, both, or neither (neither = drop the entry).
+const sanitizeAllow = (v, norm) => {
+  if (!Array.isArray(v)) return undefined;
+  const out = [...new Set(v.filter((x) => typeof x === "string" && x.trim()).map((x) => norm(x.trim())).filter(Boolean))];
+  return out.length ? out : undefined;
+};
+const allowProvidersOf = (v) => sanitizeAllow(v && v.allowProviders, (x) => normProvider(x));
+const allowModelsOf = (v) => sanitizeAllow(v && v.allowModels, (x) => x.toLowerCase());
+// Normalize one project/group rule. Returns null when it says nothing at all.
+function sanitizeRule(v) {
+  if (!v || typeof v !== "object") return null;
+  const provider = providerOf(v);
+  const allowProviders = allowProvidersOf(v);
+  const allowModels = allowModelsOf(v);
+  if (!provider && !allowProviders && !allowModels) return null;
+  return {
+    ...(provider ? { provider, model: typeof v.model === "string" ? v.model.trim() : "" } : {}),
+    ...(allowProviders ? { allowProviders } : {}),
+    ...(allowModels ? { allowModels } : {}),
+  };
+}
+
+const LIMIT_WINDOWS =["1h", "6h", "24h", "7d", "30d"];
 const WINDOW_MS = { "1h": 3600000, "6h": 21600000, "24h": 86400000, "7d": 604800000, "30d": 2592000000 };
 // Sanitize a usage-limit object from untrusted config. Returns a normalized limit or null.
 function sanitizeLimit(v) {
@@ -409,8 +437,8 @@ function mergeConfig(base, saved) {
     for (const [k, v] of Object.entries(saved.projectRoutes)) {
       if (typeof k !== "string" || !k.trim() || !v || typeof v !== "object") continue;
       if (v.block) { pr[k.trim().toLowerCase()] = { block: true }; continue; }
-      const provider = providerOf(v);
-      if (provider) pr[k.trim().toLowerCase()] = { provider, model: typeof v.model === "string" ? v.model.trim() : "" };
+      const rule = sanitizeRule(v);
+      if (rule) pr[k.trim().toLowerCase()] = rule;
     }
     c.projectRoutes = pr;
   }
@@ -442,8 +470,8 @@ function mergeConfig(base, saved) {
       seen.add(nkey);
       const limit = sanitizeLimit(g.limit);
       if (g.block) { pg.push({ name, prefixes, block: true, ...(limit ? { limit } : {}) }); continue; }
-      const provider = providerOf(g);
-      if (provider || limit) pg.push({ name, prefixes, ...(provider ? { provider, model: typeof g.model === "string" ? g.model.trim() : "" } : {}), ...(limit ? { limit } : {}) });
+      const rule = sanitizeRule(g);
+      if (rule || limit) pg.push({ name, prefixes, ...(rule || {}), ...(limit ? { limit } : {}) });
     }
     c.projectGroups = pg;
   }
@@ -1617,9 +1645,12 @@ function defaultRouteResolved(why) {
 }
 
 // Turn a per-project / per-group rule ({provider,model} or {block:true}) into a concrete route.
+// Returns null for an allowlist-only rule: it has nothing to say about WHERE the call goes, only
+// about where it may end up, so routing must fall through to the normal chain and be checked after.
 function projectRule(rule, m, label) {
   if (rule.block)
     return { provider: "blocked", blocked: true, why: `${label} is blocked (token spend disabled)`, reason: `blocked: ${label}` };
+  if (!rule.provider) return null;
   return providerRoute(rule.provider, rule.model || m, `override: ${label}`);
 }
 // First projectGroup whose prefix matches this project slug (exact or startsWith). null if none.
@@ -1628,6 +1659,39 @@ function matchProjectGroup(pkey) {
     for (const pre of g.prefixes || [])
       if (pkey === pre || pkey.startsWith(pre)) return g;
   return null;
+}
+
+// The rule that governs `pkey`, resolved exactly like accountFor(): exact path, then the consumer,
+// then a group. A rule is a property of WHO calls, not of which workload they run — before this,
+// `projectRoutes.promopilot` matched only the literal string `promopilot` and every job under it
+// (`promopilot:generatetext`) silently ignored the pin.
+function projectRuleFor(pkey) {
+  const pr = CFG.projectRoutes || {};
+  if (pr[pkey]) return { rule: pr[pkey], label: `project ${pkey}` };
+  const { consumer } = parseConsumer(pkey);
+  if (consumer && pr[consumer]) return { rule: pr[consumer], label: `consumer ${consumer}` };
+  const g = matchProjectGroup(pkey);
+  if (g) return { rule: g, label: `group ${g.name}` };
+  return null;
+}
+
+// Apply a rule's allowlists to an already-resolved route. Refuses; never rewrites — silently
+// substituting an allowed model is exactly the "answer anyway with something else" behaviour that
+// invariant 2 exists to forbid. An absent or empty list is no restriction.
+function enforceAllow(r, m, rule, label) {
+  if (!r || r.blocked) return r;
+  const ap = rule.allowProviders || [];
+  if (ap.length && !ap.includes(r.provider))
+    return { provider: "blocked", blocked: true, allowDenied: true,
+             why: `${label}: provider '${r.provider}' is not allowed here (allowed: ${ap.join(", ")})`,
+             reason: `not allowed: provider ${r.provider}` };
+  const am = rule.allowModels || [];
+  const sent = String(r.rewriteModel || m || "").toLowerCase();
+  if (am.length && !am.includes(sent))
+    return { provider: "blocked", blocked: true, allowDenied: true,
+             why: `${label}: model '${sent || "(none)"}' is not allowed here (allowed: ${am.join(", ")})`,
+             reason: `not allowed: model ${sent || "(none)"}` };
+  return r;
 }
 
 // ── per-project usage limits ────────────────────────────────────────────────
@@ -1736,12 +1800,17 @@ function resolveRoute(model, project) {
   if (isImageModel(key))
     return { provider: "blocked", blocked: true, why: `'${key}' is an image model — POST it to /v1/images/generations, not a chat endpoint`,
              reason: "image model on a text endpoint" };
-  if (pkey && CFG.projectRoutes && CFG.projectRoutes[pkey])
-    return projectRule(CFG.projectRoutes[pkey], m, `project ${pkey}`);
-  if (pkey) {
-    const g = matchProjectGroup(pkey);
-    if (g) return projectRule(g, m, `group ${g.name}`);
+  const hit = pkey ? projectRuleFor(pkey) : null;
+  if (hit) {
+    const pinned = projectRule(hit.rule, m, hit.label);
+    return enforceAllow(pinned || baseRoute(m, key), m, hit.rule, hit.label);
   }
+  return baseRoute(m, key);
+}
+
+// Routing with no project rule in play: global force → per-model override → local alias → claude* →
+// crazyrouter policy → default route.
+function baseRoute(m, key) {
   if (CFG.forceModel && CFG.forceModel.enabled && CFG.forceModel.model)
     return providerRoute(CFG.forceModel.provider, CFG.forceModel.model, "forced (global)");
   if (CFG.modelRoutes && CFG.modelRoutes[key])
@@ -2119,6 +2188,41 @@ async function handleAdminApi(req, res, path, prefix = "/admin/api/") {
     const persisted = persistConfig();
     console.log(`[admin] pin ${project} -> ${pins[project] || "(removed)"} ip=${ip} persisted=${persisted}`);
     return sendJson(res, 200, { ok: true, persisted, projectAccounts: pins });
+  }
+
+  // Set / clear ONE project's rule — pin, allowlist, or block — without resending the whole map.
+  // Same hazard as `pins`: `POST config` assigns projectRoutes wholesale, so a save built from a
+  // stale render deletes every other project's rule.
+  //   {project, block:true}                                   → reject every call
+  //   {project, provider, model?}                             → pin
+  //   {project, allowProviders:[…], allowModels:[…]}          → allowlist only, normal routing
+  //   {project, rule:null}  /  {project, clear:true}          → back to auto
+  if (sub === "routes" && req.method === "POST") {
+    const body = await readBody(req);
+    let p = {};
+    try { p = JSON.parse(body.toString()); } catch { return sendJson(res, 400, { error: "bad json" }); }
+    const project = String(p.project || "").trim().toLowerCase();
+    if (!project) return sendJson(res, 400, { error: "project required" });
+    const routes = { ...(CFG.projectRoutes || {}) };
+    if (p.clear || p.rule === null) {
+      delete routes[project];
+    } else if (p.block) {
+      routes[project] = { block: true };
+    } else {
+      // Refuse silently-empty saves: a rule that normalizes to nothing means the caller mistyped a
+      // provider, and writing "auto" for a project they meant to restrict is the wrong way to fail.
+      if (p.provider && !normProvider(p.provider))
+        return sendJson(res, 400, { error: `unknown provider '${p.provider}'`, providers: PROVIDERS });
+      for (const x of p.allowProviders || [])
+        if (!normProvider(x)) return sendJson(res, 400, { error: `unknown provider '${x}' in allowProviders`, providers: PROVIDERS });
+      const rule = sanitizeRule(p);
+      if (!rule) return sendJson(res, 400, { error: "rule says nothing — give provider, allowProviders, allowModels, or block:true" });
+      routes[project] = rule;
+    }
+    CFG.projectRoutes = routes;
+    const persisted = persistConfig();
+    console.log(`[admin] route ${project} -> ${JSON.stringify(routes[project] || "(auto)")} ip=${ip} persisted=${persisted}`);
+    return sendJson(res, 200, { ok: true, persisted, projectRoutes: routes });
   }
 
   // Replace ONE account's token. `POST config` assigns claudecodeAccountPool wholesale, so rotating
