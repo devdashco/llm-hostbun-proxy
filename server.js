@@ -91,12 +91,6 @@ const HEADROOM_LANES = new Set(
 //
 // `provider` is the field name. `lane` was the old word for the same thing and is still accepted
 // on input so existing /data/config.json keeps working.
-// Static catalog for the claudecode provider. Probing upstream /v1/models would spend a real
-// token on a real account for a list that never changes.
-const CLAUDECODE_MODELS = (process.env.CLAUDECODE_MODELS ||
-  "claude-opus-4-8,claude-sonnet-4-6,claude-sonnet-5,claude-haiku-4-5,claude-fable-5")
-  .split(",").map((x) => x.trim()).filter(Boolean);
-
 const PROVIDERS = ["local", "crazyrouter", "claudecode"];
 const PROVIDER_SET = new Set(PROVIDERS);
 // Legacy ids → canonical. `wrappy` (claudebox) and `anthropic` were two names for one thing:
@@ -155,6 +149,9 @@ function envDefaults() {
     imageToken: process.env.IMAGE_TOKEN || "",
     // models starting with this prefix (lowercased) are served by the claudecode provider.
     claudePrefix: process.env.CLAUDE_PREFIX || process.env.WRAPPY_PREFIX || "claude",
+    // claudecodeModels: the ids /v1/models advertises for the claudecode provider. Config, not
+    // code — Anthropic ships new ids without asking us. Empty by default; set them in /admin.
+    claudecodeModels: (process.env.CLAUDECODE_MODELS || "").split(",").map((x) => x.trim()).filter(Boolean),
     // Bearer gate for the uncensored model(s). When oblitToken is set, requests routed to a model
     // id listed in gatedModels require Authorization: Bearer <oblitToken> (or x-api-key). Empty
     // token = open. gemma + crazyrouter stay open so fb-bot/promopilot are unaffected.
@@ -281,6 +278,8 @@ function mergeConfig(base, saved) {
         .map((a) => ({ name: String(a.name || "acct").trim(), org: String(a.org || "").trim(), token: a.token.trim() }));
     }
   }
+  if (Array.isArray(saved.claudecodeModels))
+    c.claudecodeModels = saved.claudecodeModels.filter((x) => typeof x === "string" && x.trim()).map((x) => x.trim());
   if (typeof saved.claudePrefix === "string") c.claudePrefix = saved.claudePrefix;
   else if (typeof saved.wrappyPrefix === "string") c.claudePrefix = saved.wrappyPrefix;
   for (const k of ["oblitToken", "adminPassword"])
@@ -1220,7 +1219,8 @@ async function upstreamCatalogs() {
     const cj = await c.json();
     crazyrouter = ((cj && cj.data) || []).map((m) => ({ ...m, owned_by: "crazyrouter" }));
   } catch { /* crazyrouter down — skip */ }
-  const claudecode = CLAUDECODE_MODELS.map((id) => ({ id, object: "model", owned_by: "claudecode" }));
+  // Model ids are CONFIG, never code. Empty list = nothing advertised; add them in /admin.
+  const claudecode = (CFG.claudecodeModels || []).map((id) => ({ id, object: "model", owned_by: "claudecode" }));
   return { claudecode, crazyrouter };
 }
 
@@ -1436,6 +1436,7 @@ function adminState() {
     localMap: CFG.localMap,
     gatedModels: CFG.gatedModels,
     claudePrefix: CFG.claudePrefix,
+    claudecodeModels: CFG.claudecodeModels,
     forceModel: CFG.forceModel,
     modelRoutes: CFG.modelRoutes,
     projectRoutes: CFG.projectRoutes,
@@ -1569,6 +1570,7 @@ async function handleAdminApi(req, res, path) {
     if (patch.localMap) next.localMap = patch.localMap;
     if (patch.gatedModels) next.gatedModels = patch.gatedModels;
     if (typeof (patch.claudePrefix ?? patch.wrappyPrefix) === "string") next.claudePrefix = patch.claudePrefix ?? patch.wrappyPrefix;
+    if (Array.isArray(patch.claudecodeModels)) next.claudecodeModels = patch.claudecodeModels;
     if (patch.forceModel) next.forceModel = patch.forceModel;
     if (patch.modelRoutes) next.modelRoutes = patch.modelRoutes;
     if (patch.projectRoutes) next.projectRoutes = patch.projectRoutes;
