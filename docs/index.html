@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta name="robots" content="noindex"/>
+<title>llm.hostbun.cc — docs</title>
+<link rel="stylesheet" href="vendor/theme-dark.css"/>
+<style>
+  :root{ --theme-color:#3b82f6 }
+  body{ background:#09090b; color:#e6edf3 }
+  .sidebar, .sidebar-toggle{ background:#0c0c0f }
+  .sidebar{ border-right:1px solid #26262b }
+  .sidebar ul li a{ color:#a1a1aa }
+  .markdown-section{ max-width:900px }
+  .markdown-section h1, .markdown-section h2{ color:#fafafa }
+  .markdown-section h2{ border-bottom:1px solid #26262b; padding-bottom:6px }
+  .markdown-section code, .markdown-section pre{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace }
+  .markdown-section pre, .markdown-section pre>code{ background:#010409 }
+  .markdown-section code{ background:#1f2630; color:#e6edf3 }
+  .markdown-section table{ display:table; width:100% }
+  .markdown-section tr{ border-top:1px solid #26262b }
+  .markdown-section th, .markdown-section td{ border:1px solid #26262b }
+  .markdown-section blockquote{ border-left:none; background:#141417; border-radius:8px; padding:12px 16px; color:#e6edf3 }
+  .markdown-section blockquote p{ font-style:normal }
+</style>
+</head>
+<body>
+<div id="app">loading…</div>
+<script>
+  // The same files are served at the docs subdomain root AND under /docs on the router. Hardcoding
+  // either base path breaks the other.
+  window.$docsify = {
+    name: 'llm.hostbun.cc',
+    basePath: location.pathname.startsWith('/docs') ? '/docs/' : '/',
+    loadSidebar: true,
+    subMaxLevel: 2,
+    auto2top: true,
+    // Emoji shortcodes render as <img> from githubassets.com. This page makes zero external
+    // requests, and that is not a property we are willing to lose to a `:tada:`.
+    noEmoji: true,
+    search: { depth: 3, noData: 'No matches.', placeholder: 'Search' },
+  };
+</script>
+<!-- Vendored, self-hosted. No CDN — same rule as the control panel. -->
+<script src="vendor/docsify.js"></script>
+<script src="vendor/search.js"></script>
+</body>
+</html>

@@ -63,6 +63,8 @@ process.on("unhandledRejection", (err) => {
 
 const PORT = parseInt(process.env.PORT || "80", 10);
 const DOCS_FILE = process.env.DOCS_FILE || "/srv/docs/index.html";
+// The docsify markdown and its vendored bundle sit beside the shell, in both dev and the container.
+const DOCS_DIR = nodePath.dirname(DOCS_FILE);
 const ADMIN_FILE = process.env.ADMIN_FILE || "/srv/admin/index.html";
 // The panel's modules live next to its shell, so a dev run (ADMIN_FILE=./admin/index.html) and the
 // container (/srv/admin/index.html) both resolve without a second env var to forget.

@@ -31,9 +31,17 @@ refs may still linger in sibling repos.
   `/` — there is no `/admin` page (it 308s to `/`). The JSON API keeps the `/admin/api/*` prefix
   because `claudectl` hardcodes it; `/api/*` is the alias the SPA itself uses.
 
-## Tests — `npm test` (64 checks, ~15s)
+- `docs/` — **docsify** site: `index.html` shell + markdown pages + `_sidebar.md`, docsify vendored in
+  `docs/vendor/` (no CDN, `noEmoji: true` because emoji shortcodes fetch images from githubassets).
+  Served at `docs.llm.hostbun.cc/*` **and** `llm.hostbun.cc/docs/*` from the same files, so asset
+  paths are relative and **`/docs` 301s to `/docs/`** — without that, `vendor/docsify.js` resolves to
+  `/vendor/docsify.js` and the page renders `loading…` forever. It is **public and unauthenticated**:
+  `test/docs.test.mjs` fails the build if a password, `sk-ant-oat…`, `sk-llm-…` or a `DATABASE_URL`
+  ever lands in it.
 
-Three suites, no network, no database. Run before every push.
+## Tests — `npm test` (86 checks, ~25s)
+
+Four suites, no network, no database. Run before every push.
 
 - `translate.test.js` — the seven translation traps.
 - `test/router.test.mjs` — boots a real server on an OS-assigned port: pins, allowlists, job
@@ -43,6 +51,10 @@ Three suites, no network, no database. Run before every push.
   mounts **every** nav page. Nothing else type-checks or bundles the panel, so a wrong import name is
   otherwise a blank page in prod. jsdom is a devDependency; the image builds `npm ci --omit=dev`.
   jsdom does not run `<script type="module">`, hence the hand-built environment in that file.
+- `test/docs.test.mjs` — the docs actually render (docsify fetches its markdown at runtime, so a bad
+  `basePath` is a permanent `loading…`), every sidebar link resolves, and no secret is published.
+  Traversal is tested over a raw socket: `fetch()` strips `..` before the request leaves the process,
+  so a traversal test written with `fetch` asserts nothing.
 - `docs/` — static docs, served at `docs.llm.hostbun.cc`.
 - `headroom-svc/` — optional Python compression sidecar. Separate Coolify app, **same repo**
   (base dir `headroom-svc`). OFF unless `HEADROOM_URL` is set. **Never** applied to `claudecode` —
