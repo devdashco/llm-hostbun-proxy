@@ -521,6 +521,11 @@ function initDb() {
   // down because its *logging* backend hiccuped.
   pool.on("error", (e) => console.error(`[log] pg pool error: ${e.message}`));
   console.log(`[log] call DB → postgres ${DATABASE_URL.replace(/\/\/[^@]*@/, "//***@")}`);
+  // acct_limits is keyed by Anthropic org-id, which is opaque — nothing in the row said WHICH of our
+  // logins it belongs to, so the panel could only ever show accounts that had recently answered.
+  // The table already exists in prod, so a CREATE TABLE IF NOT EXISTS would no-op here: it has to
+  // be an explicit ADD COLUMN. Fire-and-forget, like every other write.
+  dbWrite("ALTER TABLE acct_limits ADD COLUMN IF NOT EXISTS account TEXT", []);
 }
 initDb();
 
@@ -545,13 +550,45 @@ const dbRow = async (sql, params = []) => (await dbRows(sql, params))[0] || null
 const ACCT_CACHE = new Map();
 // Distinct-value lists for the call-log filter dropdowns. 30s TTL — see `calls/facets`.
 const FACET_CACHE = { at: 0, val: null };
+// account name → Anthropic org-id, learned off response headers. Lets the accounts view join a pool
+// entry to its acct_limits row without the caller having to know the opaque org id.
+const ORG_OF_ACCOUNT = new Map();
+// account name → last probe result ({checkedAt, usable, results}). A probe costs a max_tokens:1 ping
+// per model, so it is never automatic — but the last answer is worth keeping and showing.
+const PROBE_CACHE = new Map();
 async function primeAcctCache() {
-  for (const r of await dbRows("SELECT org_id,u5,u7,s5,s7,ts FROM acct_limits")) {
+  for (const r of await dbRows("SELECT org_id,u5,u7,s5,s7,ts,account FROM acct_limits")) {
     ACCT_CACHE.set(r.org_id, { u5: r.u5, u7: r.u7, s5: r.s5, s7: r.s7, ts: Number(r.ts) || 0 });
+    if (r.account) ORG_OF_ACCOUNT.set(r.account, r.org_id);
   }
   if (ACCT_CACHE.size) console.log(`[log] primed headroom for ${ACCT_CACHE.size} account(s)`);
 }
 setTimeout(() => { primeAcctCache().catch(() => {}); }, 1000).unref();
+
+// Ping every advertised model on one account with a max_tokens:1 message. This is the ONLY honest
+// answer to "what will this subscription serve": a 429 from Anthropic carries no rate-limit headers,
+// so the harvested acct_limits row keeps reporting its last good reading while the account is dry.
+// 404 = the model id does not exist. 429 = it exists and the subscription is exhausted.
+async function probeAccount(acct) {
+  const ids = CFG.claudecodeModels || [];
+  const results = await Promise.all(ids.map(async (id) => {
+    const t0 = Date.now();
+    try {
+      const r = await fetch(`${CFG.bases.claudecode}/v1/messages`, {
+        method: "POST", headers: TR.anthropicHeaders(acct.token), signal: AbortSignal.timeout(20000),
+        body: JSON.stringify({ model: id, max_tokens: 1, messages: [{ role: "user", content: "hi" }] }),
+      });
+      let errType = null;
+      if (!r.ok) { try { errType = ((await r.json()).error || {}).type || null; } catch {} }
+      return { id, status: r.status, ok: r.ok, error: errType, ms: Date.now() - t0 };
+    } catch (e) { return { id, status: 0, ok: false, error: e.message, ms: Date.now() - t0 }; }
+  }));
+  const usable = results.filter((r) => r.ok).map((r) => r.id);
+  console.log(`[models] probe ${acct.name}: ${usable.length}/${ids.length} usable (${usable.join(",") || "none"})`);
+  const out = { account: acct.name, checkedAt: Date.now(), usable, results };
+  PROBE_CACHE.set(acct.name, out);
+  return out;
+}
 
 const clip = (s) => { const t = s == null ? "" : String(s); return (CONTENT_CAP > 0 && t.length > CONTENT_CAP) ? t.slice(0, CONTENT_CAP) : t; };
 
@@ -742,7 +779,7 @@ function extractResponseBody(buf, isStream) {
 // on every /v1/messages response — so any real call tells us that account's live 5h/7d headroom
 // at zero token cost. Upsert keyed by org-id → always the freshest per account. No-op unless the
 // headers are present (only the anthropic provider / native passthrough carries them).
-function recordLimits(headers, project, model) {
+function recordLimits(headers, project, model, account) {
   if (!dbUp() || !headers) return;
   try {
     const h = (k) => headers.get(k);
@@ -750,18 +787,20 @@ function recordLimits(headers, project, model) {
     const u5 = h("anthropic-ratelimit-unified-5h-utilization");
     const u7 = h("anthropic-ratelimit-unified-7d-utilization");
     if (!org || (u5 == null && u7 == null)) return;               // not an Anthropic-native reply
+    if (account) ORG_OF_ACCOUNT.set(account, org);
     const num = (v) => (v == null || v === "" ? null : Number(v));
     dbWrite(
-      `INSERT INTO acct_limits (org_id,ts,u5,u7,reset5,reset7,status,s5,s7,project,model)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      `INSERT INTO acct_limits (org_id,ts,u5,u7,reset5,reset7,status,s5,s7,project,model,account)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
        ON CONFLICT (org_id) DO UPDATE SET
          ts=EXCLUDED.ts, u5=EXCLUDED.u5, u7=EXCLUDED.u7, reset5=EXCLUDED.reset5, reset7=EXCLUDED.reset7,
-         status=EXCLUDED.status, s5=EXCLUDED.s5, s7=EXCLUDED.s7, project=EXCLUDED.project, model=EXCLUDED.model`,
+         status=EXCLUDED.status, s5=EXCLUDED.s5, s7=EXCLUDED.s7, project=EXCLUDED.project, model=EXCLUDED.model,
+         account=COALESCE(EXCLUDED.account, acct_limits.account)`,
       [org, Date.now(), num(u5), num(u7),
         num(h("anthropic-ratelimit-unified-5h-reset")), num(h("anthropic-ratelimit-unified-7d-reset")),
         h("anthropic-ratelimit-unified-status") || null,
         h("anthropic-ratelimit-unified-5h-status") || null, h("anthropic-ratelimit-unified-7d-status") || null,
-        project || null, model || null],
+        project || null, model || null, account || null],
     );
     // Keep the in-process snapshot warm so acctHealth() stays synchronous (adminState is not async).
     ACCT_CACHE.set(org, { u5: num(u5), u7: num(u7), s5: h("anthropic-ratelimit-unified-5h-status") || null,
@@ -1001,7 +1040,7 @@ async function proxy(req, res, base, opts = {}) {
   // failed and the caller is told so. Silently re-answering with a different model on someone
   // else's bill is what the old wrapper→crazyrouter path did, and it hid both cost and truth.
   if (provider === "claudecode" && !threw && up && up.status === 429 && opts.account) {
-    recordLimits(up.headers, base_rec.project, base_rec.sentModel || base_rec.reqModel);
+    recordLimits(up.headers, base_rec.project, base_rec.sentModel || base_rec.reqModel, opts.account);
     console.warn(`[account] 429 on ${opts.account} (project=${base_rec.project || "-"}) — no auto-switch, returning 429 to caller`);
   }
 
@@ -1025,7 +1064,7 @@ async function proxy(req, res, base, opts = {}) {
   }
   // Free rate-limit harvest: snapshot this account's live 5h/7d headroom off the response headers
   // (no probe, zero tokens). Fires for any Anthropic-native reply; a no-op for other providers.
-  recordLimits(up.headers, base_rec.project, base_rec.sentModel || base_rec.reqModel);
+  recordLimits(up.headers, base_rec.project, base_rec.sentModel || base_rec.reqModel, opts.account);
   const isStream = (up.headers.get("content-type") || "").includes("text/event-stream");
   // Only chat/responses/completions calls carry content worth recording; for those we tee the
   // body (capped) to pull tokens + reply. /v1/models etc. are skipped to keep the log signal high.
@@ -1156,7 +1195,7 @@ function finishJson(res, wantStream, parsed, rawText) {
 }
 
 async function jsonEnforce(req, res, route) {
-  const { base, injectKey, authToken, rewriteModel, model, provider, ip, bodyBuf, project } = route;
+  const { base, injectKey, authToken, rewriteModel, model, provider, ip, bodyBuf, project, account } = route;
   const maxRetries = CFG.jsonMaxRetries;
   const reqObj = JSON.parse(bodyBuf.toString());           // caller already verified this parses
   const wantStream = !!reqObj.stream;
@@ -1164,7 +1203,9 @@ async function jsonEnforce(req, res, route) {
   const logRec = {
     ts: t0, ip, ua: req.headers["user-agent"] || "", method: req.method, path: (req.url || "").split("?")[0],
     reqModel: model || null, provider, sentModel: rewriteModel || model || null,
-    keyLabel: keyLabel({ provider, target: route.target }), stream: wantStream,
+    // Same attribution as the proxy path: without the account name the row cannot be billed to
+    // a subscription, and the per-account spend view silently under-counts json-enforced calls.
+    keyLabel: account ? `claudecode:${account}` : keyLabel({ provider, target: route.target }), stream: wantStream,
     reqContent: extractRequestContent(bodyBuf), project: project || null,
     ...extractReqParams(bodyBuf),
     ...extractReqMeta(bodyBuf),
@@ -1221,7 +1262,7 @@ async function jsonEnforce(req, res, route) {
       res.writeHead(502, { "content-type": "application/json" });
       return res.end(JSON.stringify({ error: { message: "upstream fetch failed: " + e.message } }));
     }
-    if (curProvider === "claudecode") recordLimits(up.headers, logRec.project, logRec.sentModel || logRec.reqModel);
+    if (curProvider === "claudecode") recordLimits(up.headers, logRec.project, logRec.sentModel || logRec.reqModel, account);
     if (up.status >= 400) {                                // upstream error — surfaced, never masked
       console.error(`[err] upstream=${up.status} provider=${curProvider} model=${model || "-"} ${target} (json-enforce)`);
       shipError(`upstream ${up.status} ${req.method} ${req.url} (json-enforce)`, { model: model || "-", provider: curProvider, ip, status: up.status, body: text });
@@ -1321,6 +1362,11 @@ async function fetchAccountModels(acct) {
     const qs = new URLSearchParams({ limit: "100", ...(after ? { after_id: after } : {}) });
     const r = await fetch(`${CFG.bases.claudecode}/v1/models?${qs}`,
       { headers: TR.anthropicHeaders(acct.token), signal: AbortSignal.timeout(8000) });
+    // The catalog sweep is the only request we make on behalf of an account with no traffic, so it
+    // is where a cold-started router learns which opaque org-id belongs to which of our logins.
+    // Without this the accounts view shows `limits: null` until the account happens to serve a call.
+    const org = r.headers.get("anthropic-organization-id");
+    if (org) ORG_OF_ACCOUNT.set(acct.name, org);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const j = await r.json();
     const page_ = (j.data || []).filter((m) => m && typeof m.id === "string" && m.id.trim());
@@ -1798,24 +1844,66 @@ async function handleAdminApi(req, res, path, prefix = "/admin/api/") {
     let p = {};
     try { p = JSON.parse(body.toString()); } catch {}
     const pool = CFG.claudecodeAccountPool || [];
+    // `all` probes the whole pool. That is |accounts| × |models| pings, so it stays an explicit,
+    // operator-initiated action — never a background refresh.
+    if (p.all) {
+      const out = [];
+      for (const a of pool) out.push(await probeAccount(a));   // serial: don't hammer one org's limiter
+      return sendJson(res, 200, { accounts: out, checkedAt: Date.now() });
+    }
     const acct = p.account ? pool.find((a) => a.name.toLowerCase() === String(p.account).trim().toLowerCase()) : pool[0];
     if (!acct) return sendJson(res, 400, { error: "no such account", accounts: pool.map((a) => a.name) });
-    const ids = CFG.claudecodeModels || [];
-    const results = await Promise.all(ids.map(async (id) => {
-      const t0 = Date.now();
-      try {
-        const r = await fetch(`${CFG.bases.claudecode}/v1/messages`, {
-          method: "POST", headers: TR.anthropicHeaders(acct.token), signal: AbortSignal.timeout(20000),
-          body: JSON.stringify({ model: id, max_tokens: 1, messages: [{ role: "user", content: "hi" }] }),
-        });
-        let errType = null;
-        if (!r.ok) { try { errType = ((await r.json()).error || {}).type || null; } catch {} }
-        return { id, status: r.status, ok: r.ok, error: errType, ms: Date.now() - t0 };
-      } catch (e) { return { id, status: 0, ok: false, error: e.message, ms: Date.now() - t0 }; }
-    }));
-    const usable = results.filter((r) => r.ok).map((r) => r.id);
-    console.log(`[models] probe ${acct.name}: ${usable.length}/${ids.length} usable (${usable.join(",") || "none"})`);
-    return sendJson(res, 200, { account: acct.name, checkedAt: Date.now(), usable, results });
+    return sendJson(res, 200, await probeAccount(acct));
+  }
+
+  // Everything the operator needs to answer "can this account serve anything, and who is spending
+  // it". The pool is the spine — an account with no traffic and no probe still gets a row, which is
+  // exactly the case the old org-keyed limits table could not represent.
+  if (sub === "accounts" && req.method === "GET") {
+    const pool = CFG.claudecodeAccountPool || [];
+    const pins = CFG.projectAccounts || CFG.consumerAccounts || {};
+    const lim = new Map();
+    for (const r of await dbRows("SELECT org_id,ts,u5,u7,reset5,reset7,status,s5,s7,project,model,account FROM acct_limits")) {
+      lim.set(r.org_id, r);
+    }
+    // Old rows label the account `anthropic:philip` / `wrappy:philip`; new ones `claudecode:philip`.
+    // The name after the colon is the join key, so every era of the log counts toward the same account.
+    const spendRows = await dbRows(
+      `SELECT split_part(key_label, ':', 2) AS acct,
+         COUNT(*)::int AS calls, COALESCE(SUM(total_tokens),0)::bigint AS tokens, MAX(ts) AS last_ts,
+         COUNT(*) FILTER (WHERE status = 429)::int AS rate_limited,
+         COUNT(*) FILTER (WHERE status >= 400)::int AS errors
+       FROM calls WHERE key_label LIKE '%:%' GROUP BY 1`);
+    const spend = new Map(spendRows.map((r) => [String(r.acct), r]));
+    const dayAgo = Date.now() - 86400000;
+    const spend24Rows = await dbRows(
+      `SELECT split_part(key_label, ':', 2) AS acct, COUNT(*)::int AS calls,
+         COALESCE(SUM(total_tokens),0)::bigint AS tokens
+       FROM calls WHERE key_label LIKE '%:%' AND ts >= $1 GROUP BY 1`, [dayAgo]);
+    const spend24 = new Map(spend24Rows.map((r) => [String(r.acct), r]));
+
+    const accounts = pool.map((a) => {
+      const org = ORG_OF_ACCOUNT.get(a.name) || null;
+      const l = org ? lim.get(org) : null;
+      const s = spend.get(a.name) || {}, s24 = spend24.get(a.name) || {};
+      const pr = PROBE_CACHE.get(a.name) || null;
+      return {
+        name: a.name, org,
+        projects: Object.keys(pins).filter((p) => pins[p] === a.name).sort(),
+        limits: l ? { ts: Number(l.ts) || 0, u5: l.u5, u7: l.u7, reset5: l.reset5, reset7: l.reset7,
+          status: l.status, s5: l.s5, s7: l.s7, lastProject: l.project, lastModel: l.model } : null,
+        usage: { calls: s.calls || 0, tokens: Number(s.tokens) || 0, lastTs: Number(s.last_ts) || 0,
+          rateLimited: s.rate_limited || 0, errors: s.errors || 0,
+          calls24h: s24.calls || 0, tokens24h: Number(s24.tokens) || 0 },
+        probe: pr ? { checkedAt: pr.checkedAt, usable: pr.usable, total: pr.results.length } : null,
+      };
+    });
+    return sendJson(res, 200, {
+      accounts, now: Date.now(), defaultAccount: CFG.defaultAccount || "",
+      advertisedModels: (CFG.claudecodeModels || []).length,
+      // A pinned project naming an account that no longer exists in the pool 403s at request time.
+      orphanPins: Object.entries(pins).filter(([, acc]) => !pool.some((a) => a.name === acc)).map(([p, acc]) => ({ project: p, account: acc })),
+    });
   }
 
   // Pin / unpin ONE project without resending the whole map. `POST config` assigns
