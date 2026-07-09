@@ -54,7 +54,7 @@ summary{cursor:pointer;font-weight:600}
 <li><b>Account pinning</b> (claudecode only). Your project is looked up in the pin table. Not pinned → <span class="err">403 no_account_for_project</span>. Pinned → that account's token is injected and the required Anthropic headers are synthesized. <b>Your own <code>Authorization</code> header is overwritten regardless.</b></li>
 <li><b>Upstream call.</b> One round trip. On <code>claudecode</code> an OpenAI-shaped body is translated to Anthropic and back; a native <code>/v1/messages</code> body is forwarded byte-for-byte. On <code>crazyrouter</code> and <code>local</code> the body is forwarded as-is with the key swapped.</li>
 <li><b>JSON enforcement.</b> If you asked for <code>response_format</code>, the reply is parsed, repaired, or re-prompted before you see it.</li>
-<li><b>Logging.</b> The call — including full prompt and full reply — is written to SQLite.</li>
+<li><b>Logging.</b> The call — including full prompt and full reply — is written to the <code>llmrouter</code> Postgres database.</li>
 </ol></div>
 
 <p><b>There is no fallback, anywhere.</b> If the pinned account is out of quota you get its real <code>429</code>. If upstream 500s you get its real <code>5xx</code>. The gateway will never silently answer from a different account or a different provider. That behaviour once hid both the cost and the truth; it is gone on purpose.</p>
@@ -253,7 +253,7 @@ curl -s https://llm.hostbun.cc/v1/images/generations -H "Content-Type: applicati
 
 <h2 id="data">What gets stored</h2>
 <div class="card">
-<p>Every request is written to a SQLite <code>calls</code> table on the gateway's volume. Per call:</p>
+<p>Every request is written to a <code>calls</code> table in the <code>llmrouter</code> Postgres database. Per call:</p>
 <ul>
 <li><b>Your IP and User-Agent</b>, method, path, timestamp, latency.</li>
 <li>Requested model, resolved provider, the model actually sent upstream, which account served it, HTTP status.</li>

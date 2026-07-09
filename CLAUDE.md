@@ -9,7 +9,7 @@ refs may still linger in sibling repos.
 
 ## Layout
 
-- `server.js` — the whole router: routing, live `CFG`, admin API, SQLite call log.
+- `server.js` — the whole router: routing, live `CFG`, admin API, Postgres call log.
 - `translate.js` — OpenAI ↔ Anthropic translation. `translate.test.js` (`node translate.test.js`).
 - `admin/` — password-gated SPA (Preact + htm, vendored inline, no CDN). pw `ddash`.
 - `docs/` — static docs, served at `docs.llm.hostbun.cc`.
@@ -87,11 +87,39 @@ real request. The headroom sidecar is app `i7pfies89s3maf390ye3rllk`. Both live 
 `Dockerfile` copies files individually. **If you add a new `require`d file, add a `COPY` line** or
 the container crash-loops on boot.
 
+## Storage
+
+Two very different things, and only one of them is a database.
+
+**The call log lives in Postgres** — database `llmrouter` on the pbox cluster, reached via
+`DATABASE_URL` (set in Coolify env, never in git). Tables `calls` and `acct_limits`, created by
+migration `0001_calls_and_acct_limits`. It used to be a SQLite file on the app's volume; that file is
+gone. `pg` is the router's only runtime dependency, so the Dockerfile now runs `npm ci` — if you add a
+dependency, the lockfile must be committed or the build fails.
+
+**The config still lives on the volume** — `/data/config.json`. That is where the account tokens are.
+
 ## Gotchas that will cost you a day
 
 - **The account tokens exist in exactly one place**: `anthropicPool` / `claudecodeAccountPool` inside
   `/data/config.json` on the app's volume. Not in env, not in git, no backup. Lose the volume, lose
   the subscriptions. Back it up before touching the app, the server, or the volume.
+- **The Postgres link is not encrypted.** The pbox cluster answers `The server does not support SSL
+  connections`, so `sslmode=disable` is not a shortcut, it is the only option today. The router is on
+  hostbun and the DB is on pbox, so **every prompt and every reply crosses the public internet in
+  cleartext**, and so does the DB password. Fix by fronting Postgres with TLS or routing over the
+  `pbox-proxy-tunnel`. Until then, `logging.content = false` is the blunt mitigation.
+- **`pg` returns BIGINT as a string.** Every `ts`, `id` and `SUM()` in this schema is a bigint. Left
+  unparsed they break timestamp arithmetic and the shapes the admin UI expects. `server.js` installs
+  type parsers for oid 20 (int8) and 1700 (numeric) at boot; don't remove them.
+- **Postgres is stricter than SQLite was.** `GROUP_CONCAT` → `string_agg`; a bare column may not ride
+  along outside `GROUP BY` (hence `MAX(provider)` in `byModel`); `json_extract` does not exist, and
+  casting `user_id::jsonb` throws on the rows where it isn't JSON — the conversations view extracts
+  `session_id` with a regex for exactly that reason.
+- **Writes are fire-and-forget.** `recordCall` never awaits, and a failed INSERT logs a warning and is
+  dropped. That is deliberate: the DB is a network hop away, and losing a log line must never fail an
+  inference request. It does mean the log can silently under-count if the DB is down — watch for
+  `[log] write failed`.
 - **There is no auth on the inference endpoints.** Anyone who can reach `llm.hostbun.cc` can spend the
   Max subscriptions. Only `/admin` is gated. This is the largest open risk. Note that `X-Project` is
   **attribution, not authentication** — it is a self-asserted string, and `extractProject()` also
@@ -133,7 +161,7 @@ Its `proxy_*` MCP tools drive this repo over the admin API — they log in at `P
 |------|---------------------------|
 | `proxy_state`, `proxy_config`, `proxy_reset_config` | the live `CFG` (providers, overrides, forceModel) |
 | `proxy_health`, `proxy_models`, `proxy_resolve`, `proxy_test` | provider health, merged catalog, route a model id |
-| `proxy_stats`, `proxy_calls`, `proxy_clear_calls` | the SQLite call log + per-project usage |
+| `proxy_stats`, `proxy_calls`, `proxy_clear_calls` | the Postgres call log + per-project usage |
 | `proxy_limits` | live 5h/7d headroom per account, harvested free from response headers |
 
 Consequences worth remembering:

@@ -50,7 +50,9 @@ const DOCS_FILE = process.env.DOCS_FILE || "/srv/docs/index.html";
 const ADMIN_FILE = process.env.ADMIN_FILE || "/srv/admin/index.html";
 const PRICES_FILE = process.env.PRICES_FILE || "/srv/prices.json";
 const CONFIG_FILE = process.env.CONFIG_FILE || "/data/config.json";
-const CALLS_DB = process.env.CALLS_DB || "/data/calls.db";
+// Call log lives in the `llmrouter` Postgres, NOT on the container's volume. Unset ⇒ logging off;
+// the router still proxies. Set in Coolify env, never in git — it carries the DB password.
+const DATABASE_URL = process.env.DATABASE_URL || "";
 // Max bytes of prompt / reply text stored per call (protects the DB from huge payloads).
 const CONTENT_CAP = parseInt(process.env.CALL_CONTENT_CAP || "0", 10); // 0 = uncapped (store full prompt+reply)
 
@@ -227,7 +229,7 @@ function envDefaults() {
     requireProject: (process.env.REQUIRE_PROJECT || "1") === "1",
     // Admin password (HMAC secret + login check). Weak default per request — rotate via the UI.
     adminPassword: process.env.ADMIN_PASSWORD || "ddash",
-    // Call logging → SQLite at CALLS_DB. enabled: record any call metadata at all;
+    // Call logging → the `llmrouter` Postgres (DATABASE_URL). enabled: record any call metadata at all;
     // content: also store the prompt + the model's reply text (uncapped unless CONTENT_CAP > 0);
     // retain: keep at most this many rows (oldest pruned). 0 = keep every row forever, no pruning.
     logging: {
@@ -442,127 +444,75 @@ function costUsd(prices, sentModel, provider, ptok, ctok) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Call log → SQLite (node:sqlite, built in). One row per request that reaches a
-// provider (incl. blocked/gated/error). Lives on the /data persistent volume so it
-// survives restarts/redeploys. All DB work is wrapped so a logging failure can
-// never break proxying.
+// Call log → Postgres (`llmrouter` DB on the pbox cluster; DATABASE_URL).
+// One row per request that reaches a provider, refusals included.
+//
+// It used to be a SQLite file on the container's volume. That volume has no backup and dies with
+// the app, and a rolling deploy put two containers on the same file — which is how logging silently
+// disabled itself for a whole container lifetime. The log now lives in a real project database.
+//
+// `pg` is the router's ONLY dependency. Every DB call here is wrapped or fire-and-forget: losing the
+// call log must never break proxying, which is the one job this process actually has.
 // ─────────────────────────────────────────────────────────────────────────────
-let db = null, insertStmt = null, pruneStmt = null, limitsStmt = null, insertsSincePrune = 0;
+const { Pool, types: pgTypes } = require("pg");
+// pg returns BIGINT (oid 20) as a STRING, because a 64-bit int can exceed Number.MAX_SAFE_INTEGER.
+// Every bigint here is an epoch-ms timestamp, a row id, or a token count — all far inside that
+// range. Left as strings they break `ts` arithmetic, JSON shapes the admin UI expects, and any
+// SUM(). Parse them as numbers once, globally, instead of converting at 30 call sites.
+pgTypes.setTypeParser(20, (v) => (v === null ? null : Number(v)));   // int8
+pgTypes.setTypeParser(1700, (v) => (v === null ? null : Number(v))); // numeric (SUM of ints)
+let pool = null, insertsSincePrune = 0;
+const dbUp = () => !!pool;
+
 function initDb() {
-  try {
-    const { DatabaseSync } = require("node:sqlite");
-    fs.mkdirSync(path.dirname(CALLS_DB), { recursive: true });
-    db = new DatabaseSync(CALLS_DB);
-    // busy_timeout FIRST: a rolling deploy overlaps the old and new containers on the same volume,
-    // so the outgoing process still holds the file. `PRAGMA journal_mode=WAL` is itself a write and
-    // throws SQLITE_BUSY without this — which used to abort initDb and disable logging for the whole
-    // life of the container. Wait for the old process to let go instead of giving up.
-    db.exec("PRAGMA busy_timeout=15000;");
-    db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
-    db.exec(`CREATE TABLE IF NOT EXISTS calls (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ts INTEGER NOT NULL,
-      ip TEXT, ua TEXT, method TEXT, path TEXT,
-      req_model TEXT, provider TEXT, sent_model TEXT, key_label TEXT,
-      status INTEGER, duration_ms INTEGER, stream INTEGER,
-      prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER,
-      error TEXT, req_content TEXT, resp_content TEXT, project TEXT,
-      effort TEXT, thinking_tokens INTEGER, max_tokens INTEGER, temperature REAL,
-      user_id TEXT, cache_read INTEGER, cache_write INTEGER, stop_reason TEXT,
-      tool_count INTEGER, mcp_tools INTEGER, tool_servers TEXT, tools_kb INTEGER, msg_count INTEGER, system_kb INTEGER
-    );`);
-    // Migrate older DBs that predate later columns (each idempotent — throws if it already exists).
-    try { db.exec("ALTER TABLE calls ADD COLUMN project TEXT;"); } catch { /* already there */ }
-    try { db.exec("ALTER TABLE calls ADD COLUMN effort TEXT;"); } catch { /* already there */ }
-    try { db.exec("ALTER TABLE calls ADD COLUMN thinking_tokens INTEGER;"); } catch { /* already there */ }
-    try { db.exec("ALTER TABLE calls ADD COLUMN max_tokens INTEGER;"); } catch { /* already there */ }
-    try { db.exec("ALTER TABLE calls ADD COLUMN temperature REAL;"); } catch { /* already there */ }
-    // user_id = the caller's session/user identity (Claude Code stamps metadata.user_id per session);
-    // cache_read/cache_write = Anthropic prompt-cache tokens kept separate; stop_reason = why it ended.
-    try { db.exec("ALTER TABLE calls ADD COLUMN user_id TEXT;"); } catch { /* already there */ }
-    try { db.exec("ALTER TABLE calls ADD COLUMN cache_read INTEGER;"); } catch { /* already there */ }
-    try { db.exec("ALTER TABLE calls ADD COLUMN cache_write INTEGER;"); } catch { /* already there */ }
-    // per-request shape metrics: enabled tools / MCP servers / tool-schema tax / convo length
-    try { db.exec("ALTER TABLE calls ADD COLUMN tool_count INTEGER;"); } catch { /* already there */ }
-    try { db.exec("ALTER TABLE calls ADD COLUMN mcp_tools INTEGER;"); } catch { /* already there */ }
-    try { db.exec("ALTER TABLE calls ADD COLUMN tool_servers TEXT;"); } catch { /* already there */ }
-    try { db.exec("ALTER TABLE calls ADD COLUMN tools_kb INTEGER;"); } catch { /* already there */ }
-    try { db.exec("ALTER TABLE calls ADD COLUMN msg_count INTEGER;"); } catch { /* already there */ }
-    try { db.exec("ALTER TABLE calls ADD COLUMN system_kb INTEGER;"); } catch { /* already there */ }
-    try { db.exec("ALTER TABLE calls ADD COLUMN stop_reason TEXT;"); } catch { /* already there */ }
-    // `lane` was renamed to `provider`. A DB created before that rename has the old column and,
-    // because CREATE TABLE IF NOT EXISTS no-ops, never grows the new one — every INSERT and the
-    // provider index then fail, initDb catches, and call logging silently turns itself off.
-    // Add the column, then backfill it from `lane` so old rows keep their provider attribution
-    // (retention prunes by provider name, so an unbackfilled row would look like a NULL provider).
-    try { db.exec("ALTER TABLE calls ADD COLUMN provider TEXT;"); } catch { /* already there */ }
-    // Backfill runs out of band (see backfillProviders): on a rolling deploy the outgoing container
-    // still holds a write lock, and a full-table UPDATE loses that race. Boot must not block on it.
-    // Index creation must never be fatal. An index is an optimisation; losing one is a slow query,
-    // but letting it throw here costs the entire call log.
-    for (const ix of [
-      "CREATE INDEX IF NOT EXISTS idx_calls_ts ON calls(ts);",
-      "CREATE INDEX IF NOT EXISTS idx_calls_model ON calls(req_model);",
-      "CREATE INDEX IF NOT EXISTS idx_calls_provider ON calls(provider);",
-      "CREATE INDEX IF NOT EXISTS idx_calls_project ON calls(project);",
-      "CREATE INDEX IF NOT EXISTS idx_calls_project_ts ON calls(project, ts);", // per-project usage windows
-    ]) { try { db.exec(ix); } catch (e) { console.warn(`[log] index skipped: ${e.message}`); } }
-    try { db.exec("CREATE INDEX IF NOT EXISTS idx_calls_user ON calls(user_id);"); } catch { /* col may not exist on very old dbs mid-migrate */ }
-    insertStmt = db.prepare(`INSERT INTO calls
-      (ts,ip,ua,method,path,req_model,provider,sent_model,key_label,status,duration_ms,stream,prompt_tokens,completion_tokens,total_tokens,error,req_content,resp_content,project,effort,thinking_tokens,max_tokens,temperature,user_id,cache_read,cache_write,stop_reason,tool_count,mcp_tools,tool_servers,tools_kb,msg_count,system_kb)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-    // Retention prunes the oldest NON-dev rows only — Claude Code chats are exempt and kept forever,
-    // so a burst of prod traffic can never evict your saved conversations.
-    // Only runs when CFG.logging.retain > 0; retain=0 (the default) keeps EVERY row on EVERY provider forever.
-    // Match BOTH names: rows written before the rename carry provider='anthropic', rows after it carry
-    // 'claudecode'. Exempting only one of them silently makes the other prunable.
-    pruneStmt = db.prepare(`DELETE FROM calls WHERE provider NOT IN ('anthropic','claudecode')
-      AND id NOT IN (SELECT id FROM calls WHERE provider NOT IN ('anthropic','claudecode') ORDER BY id DESC LIMIT ?)`);
-    // acct_limits: the LATEST Anthropic rate-limit snapshot per account, harvested for FREE off the
-    // `anthropic-ratelimit-unified-*` response headers of real inference traffic (no probe / zero
-    // tokens). Keyed by anthropic-organization-id (the account identity, which every /v1/messages
-    // response carries). One row per account, upserted on every call that carries the headers — so
-    // the dashboard reads current 5h/7d utilization without ever spending the budget it measures.
-    db.exec(`CREATE TABLE IF NOT EXISTS acct_limits (
-      org_id TEXT PRIMARY KEY, ts INTEGER,
-      u5 REAL, u7 REAL, reset5 INTEGER, reset7 INTEGER,
-      status TEXT, s5 TEXT, s7 TEXT, project TEXT, model TEXT
-    );`);
-    limitsStmt = db.prepare(`INSERT INTO acct_limits (org_id,ts,u5,u7,reset5,reset7,status,s5,s7,project,model)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?)
-      ON CONFLICT(org_id) DO UPDATE SET
-        ts=excluded.ts, u5=excluded.u5, u7=excluded.u7, reset5=excluded.reset5, reset7=excluded.reset7,
-        status=excluded.status, s5=excluded.s5, s7=excluded.s7, project=excluded.project, model=excluded.model`);
-    console.log(`[log] call DB ready at ${CALLS_DB}`);
-  } catch (e) {
-    db = null;
-    console.error(`[log] call DB unavailable (${e.message}); call logging disabled`);
+  if (!DATABASE_URL) {
+    console.error("[log] DATABASE_URL not set; call logging disabled");
+    return;
   }
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    max: 8,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 8_000,
+    // The router is on hostbun and the DB is on pbox, so every query crosses the public internet.
+    // A hung socket must not wedge a request handler.
+    statement_timeout: 20_000,
+    query_timeout: 20_000,
+  });
+  // A pool error (upstream restart, network blip) is emitted on the pool, not the query. Without a
+  // listener Node treats it as an unhandled 'error' event and kills the process — taking the router
+  // down because its *logging* backend hiccuped.
+  pool.on("error", (e) => console.error(`[log] pg pool error: ${e.message}`));
+  console.log(`[log] call DB → postgres ${DATABASE_URL.replace(/\/\/[^@]*@/, "//***@")}`);
 }
 initDb();
 
-// One-time `lane` → `provider` backfill for rows written before the rename, retried out of band.
-// It cannot run inline at boot: a Coolify rolling deploy keeps the OLD container serving (and
-// writing) until the new one is healthy, so a full-table UPDATE hits SQLITE_BUSY and loses. Retry
-// until the old process exits. Rows left NULL are not merely cosmetic — the conversations view
-// filters on provider, and the retention prune's `provider NOT IN (...)` is never true for NULL.
-function backfillProviders(attempt = 0) {
-  if (!db) return;
-  try {
-    const hasLane = db.prepare("SELECT COUNT(*) n FROM pragma_table_info('calls') WHERE name='lane'").get().n > 0;
-    if (!hasLane) return;                       // fresh DB, or `lane` already dropped — nothing to do
-    const stale = db.prepare("SELECT COUNT(*) n FROM calls WHERE provider IS NULL AND lane IS NOT NULL").get().n;
-    if (!stale) return;                         // already drained; do not rewrite the table every boot
-    db.exec("UPDATE calls SET provider = lane WHERE provider IS NULL AND lane IS NOT NULL;");
-    console.log(`[log] migrated ${stale} pre-rename row(s): lane → provider`);
-  } catch (e) {
-    if (attempt >= 10) { console.error(`[log] provider backfill GAVE UP after ${attempt} tries: ${e.message}`); return; }
-    const wait = Math.min(60000, 5000 * (attempt + 1));
-    console.warn(`[log] provider backfill busy (${e.message}); retrying in ${wait / 1000}s`);
-    setTimeout(() => backfillProviders(attempt + 1), wait).unref();
-  }
+// Fire-and-forget write. Never awaited on the hot path: an inference request must not wait on, or
+// fail because of, a cross-internet INSERT.
+function dbWrite(sql, params) {
+  if (!pool) return;
+  pool.query(sql, params).catch((e) => console.warn(`[log] write failed: ${e.message}`));
 }
-setTimeout(() => backfillProviders(0), 5000).unref();
+// Awaited read, used by the admin API. Returns [] rather than throwing so one bad panel can't 500
+// the whole dashboard.
+async function dbRows(sql, params = []) {
+  if (!pool) return [];
+  try { return (await pool.query(sql, params)).rows; }
+  catch (e) { console.warn(`[log] query failed: ${e.message}`); return []; }
+}
+const dbRow = async (sql, params = []) => (await dbRows(sql, params))[0] || null;
+
+// Latest rate-limit snapshot per Anthropic org, held in memory so acctHealth() can stay synchronous.
+// recordLimits() refreshes it on every call that carries the headers; this primes it once at boot so
+// a freshly restarted container still shows real headroom before the first Anthropic response lands.
+const ACCT_CACHE = new Map();
+async function primeAcctCache() {
+  for (const r of await dbRows("SELECT org_id,u5,u7,s5,s7,ts FROM acct_limits")) {
+    ACCT_CACHE.set(r.org_id, { u5: r.u5, u7: r.u7, s5: r.s5, s7: r.s7, ts: Number(r.ts) || 0 });
+  }
+  if (ACCT_CACHE.size) console.log(`[log] primed headroom for ${ACCT_CACHE.size} account(s)`);
+}
+setTimeout(() => { primeAcctCache().catch(() => {}); }, 1000).unref();
 
 const clip = (s) => { const t = s == null ? "" : String(s); return (CONTENT_CAP > 0 && t.length > CONTENT_CAP) ? t.slice(0, CONTENT_CAP) : t; };
 
@@ -754,7 +704,7 @@ function extractResponseBody(buf, isStream) {
 // at zero token cost. Upsert keyed by org-id → always the freshest per account. No-op unless the
 // headers are present (only the anthropic provider / native passthrough carries them).
 function recordLimits(headers, project, model) {
-  if (!db || !limitsStmt || !headers) return;
+  if (!dbUp() || !headers) return;
   try {
     const h = (k) => headers.get(k);
     const org = h("anthropic-organization-id");
@@ -762,24 +712,38 @@ function recordLimits(headers, project, model) {
     const u7 = h("anthropic-ratelimit-unified-7d-utilization");
     if (!org || (u5 == null && u7 == null)) return;               // not an Anthropic-native reply
     const num = (v) => (v == null || v === "" ? null : Number(v));
-    limitsStmt.run(
-      org, Date.now(), num(u5), num(u7),
-      num(h("anthropic-ratelimit-unified-5h-reset")), num(h("anthropic-ratelimit-unified-7d-reset")),
-      h("anthropic-ratelimit-unified-status") || null,
-      h("anthropic-ratelimit-unified-5h-status") || null, h("anthropic-ratelimit-unified-7d-status") || null,
-      project || null, model || null,
+    dbWrite(
+      `INSERT INTO acct_limits (org_id,ts,u5,u7,reset5,reset7,status,s5,s7,project,model)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       ON CONFLICT (org_id) DO UPDATE SET
+         ts=EXCLUDED.ts, u5=EXCLUDED.u5, u7=EXCLUDED.u7, reset5=EXCLUDED.reset5, reset7=EXCLUDED.reset7,
+         status=EXCLUDED.status, s5=EXCLUDED.s5, s7=EXCLUDED.s7, project=EXCLUDED.project, model=EXCLUDED.model`,
+      [org, Date.now(), num(u5), num(u7),
+        num(h("anthropic-ratelimit-unified-5h-reset")), num(h("anthropic-ratelimit-unified-7d-reset")),
+        h("anthropic-ratelimit-unified-status") || null,
+        h("anthropic-ratelimit-unified-5h-status") || null, h("anthropic-ratelimit-unified-7d-status") || null,
+        project || null, model || null],
     );
+    // Keep the in-process snapshot warm so acctHealth() stays synchronous (adminState is not async).
+    ACCT_CACHE.set(org, { u5: num(u5), u7: num(u7), s5: h("anthropic-ratelimit-unified-5h-status") || null,
+      s7: h("anthropic-ratelimit-unified-7d-status") || null, ts: Date.now() });
   } catch { /* never let limit-harvest break a request */ }
 }
 
+const CALL_COLS = "ts,ip,ua,method,path,req_model,provider,sent_model,key_label,status,duration_ms,stream," +
+  "prompt_tokens,completion_tokens,total_tokens,error,req_content,resp_content,project,effort," +
+  "thinking_tokens,max_tokens,temperature,user_id,cache_read,cache_write,stop_reason,tool_count," +
+  "mcp_tools,tool_servers,tools_kb,msg_count,system_kb";
+const CALL_PLACEHOLDERS = Array.from({ length: 33 }, (_, i) => `$${i + 1}`).join(",");
+
 function recordCall(rec) {
-  if (!db || !insertStmt || !CFG.logging.enabled) return;
+  if (!dbUp() || !CFG.logging.enabled) return;
   try {
     const u = rec.usage || {};
-    insertStmt.run(
+    dbWrite(`INSERT INTO calls (${CALL_COLS}) VALUES (${CALL_PLACEHOLDERS})`, [
       rec.ts || Date.now(), rec.ip || null, rec.ua || null, rec.method || null, rec.path || null,
       rec.reqModel || null, rec.provider || null, rec.sentModel || null, rec.keyLabel || null,
-      rec.status == null ? null : rec.status, rec.ms == null ? null : rec.ms, rec.stream ? 1 : 0,
+      rec.status == null ? null : rec.status, rec.ms == null ? null : rec.ms, !!rec.stream,
       u.prompt_tokens ?? null, u.completion_tokens ?? null, u.total_tokens ?? null,
       rec.error || null,
       CFG.logging.content ? (rec.reqContent || null) : null,
@@ -799,9 +763,17 @@ function recordCall(rec) {
       rec.toolsKb == null ? null : rec.toolsKb,
       rec.msgCount == null ? null : rec.msgCount,
       rec.systemKb == null ? null : rec.systemKb,
-    );
-    // retain=0 → keep every row forever (no pruning on any provider).
-    if (CFG.logging.retain > 0 && ++insertsSincePrune >= 200) { insertsSincePrune = 0; try { pruneStmt.run(CFG.logging.retain); } catch {} }
+    ]);
+    // retain=0 → keep every row forever (no pruning on any provider). Claude Code chats are exempt
+    // and kept regardless; match both the pre- and post-rename provider names or one becomes prunable.
+    if (CFG.logging.retain > 0 && ++insertsSincePrune >= 200) {
+      insertsSincePrune = 0;
+      dbWrite(
+        `DELETE FROM calls WHERE provider NOT IN ('anthropic','claudecode')
+           AND id NOT IN (SELECT id FROM calls WHERE provider NOT IN ('anthropic','claudecode')
+                          ORDER BY id DESC LIMIT $1)`,
+        [CFG.logging.retain]);
+    }
   } catch (e) { /* never let logging break a request */ }
 }
 
@@ -1339,24 +1311,26 @@ function limitFor(project) {
 }
 // Rolling-window usage for a project from the call log, cached ~5s to avoid per-request SUMs.
 const _usageCache = new Map();
-function projectUsage(project, windowMs) {
-  if (!db || !project) return { tokens: 0, calls: 0 };
+async function projectUsage(project, windowMs) {
+  if (!dbUp() || !project) return { tokens: 0, calls: 0 };
   const key = project + "|" + windowMs, now = Date.now(), c = _usageCache.get(key);
-  if (c && now - c.at < 5000) return c.val;
+  if (c && now - c.at < 5000) return c.val;                 // ~5s cache: this is on the hot path
   let val = { tokens: 0, calls: 0 };
-  try {
-    const r = db.prepare("SELECT COUNT(*) calls, COALESCE(SUM(total_tokens),0) tokens FROM calls WHERE project=? AND ts>=?").get(project, now - windowMs);
-    val = { tokens: r.tokens || 0, calls: r.calls || 0 };
-  } catch { /* db hiccup → treat as no usage, never block on a query error */ }
+  const r = await dbRow(
+    "SELECT COUNT(*)::int AS calls, COALESCE(SUM(total_tokens),0)::bigint AS tokens FROM calls WHERE project=$1 AND ts>=$2",
+    [project, now - windowMs]);
+  // dbRow swallows errors and returns null → treat as no usage. A quota check must never be the
+  // reason an inference request fails.
+  if (r) val = { tokens: Number(r.tokens) || 0, calls: Number(r.calls) || 0 };
   _usageCache.set(key, { at: now, val });
   return val;
 }
 // Decide what to do for this project right now. null = no limit configured.
 // action ∈ ok | warn | slow | block. pct = max(token%, call%) of the cap.
-function usageVerdict(project) {
+async function usageVerdict(project) {
   const lim = limitFor(project);
   if (!lim) return null;
-  const u = projectUsage(project, WINDOW_MS[lim.window] || WINDOW_MS["24h"]);
+  const u = await projectUsage(project, WINDOW_MS[lim.window] || WINDOW_MS["24h"]);
   const pt = lim.tokens > 0 ? u.tokens / lim.tokens : 0;
   const pc = lim.calls > 0 ? u.calls / lim.calls : 0;
   const pct = Math.max(pt, pc);
@@ -1379,10 +1353,13 @@ function usageVerdict(project) {
 // caller. You fix that by re-pinning in /admin — not by the gateway guessing.
 //
 // `acctHealth` exists for DISPLAY and DEBUGGING only. It never influences which account is chosen.
+// Synchronous read of the latest per-account headroom, because adminState() is synchronous and the
+// DB is now a network hop away. ACCT_CACHE is filled by recordLimits() off live traffic and primed
+// once at boot (see primeAcctCache), so this never blocks and never awaits.
 function acctHealth(org) {
   try {
-    const r = org && db && db.prepare("SELECT u5,u7,s5,s7,ts FROM acct_limits WHERE org_id=?").get(org);
-    if (!r) return { util: 0, hot: false, ts: 0 };
+    const r = org ? ACCT_CACHE.get(org) : null;
+    if (!r) return { util: 0, hot: false, ts: 0, stale: true };
     const stale = !r.ts || (Date.now() - r.ts > 6 * 3600 * 1000);   // no fresh reading → unknown, not "cool"
     const util = stale ? 0 : Math.max(r.u5 || 0, r.u7 || 0);
     const hot = !stale && ((r.u5 || 0) >= 0.95 || (r.u7 || 0) >= 0.98 || r.s5 === "rejected" || r.s7 === "rejected");
@@ -1509,7 +1486,7 @@ function adminState() {
     jsonMaxRetries: CFG.jsonMaxRetries,
     requireProject: CFG.requireProject,
     logging: CFG.logging,
-    loggingDbReady: !!db,
+    loggingDbReady: dbUp(),
     // secrets — never returned in clear
     crazyrouterKeySet: !!CFG.crazyrouterKey, crazyrouterKeyMasked: mask(CFG.crazyrouterKey),
     // Each account carries its harvested headroom AND the age of that reading, so any consumer
@@ -1680,10 +1657,8 @@ async function handleAdminApi(req, res, path) {
   // One row per anthropic org-id with live 5h/7d utilization + reset + status. Dashboards read this
   // instead of probing. Rows go stale for accounts with no recent traffic (ts shows how fresh).
   if (sub === "limits" && req.method === "GET") {
-    try {
-      const rows = db ? db.prepare("SELECT org_id,ts,u5,u7,reset5,reset7,status,s5,s7,project,model FROM acct_limits ORDER BY ts DESC").all() : [];
-      return sendJson(res, 200, { rows, now: Date.now() });
-    } catch (e) { return sendJson(res, 200, { rows: [], error: String(e && e.message || e) }); }
+    const rows = await dbRows("SELECT org_id,ts,u5,u7,reset5,reset7,status,s5,s7,project,model FROM acct_limits ORDER BY ts DESC");
+    return sendJson(res, 200, { rows, now: Date.now() });
   }
 
   if (sub === "crazyrouter" && req.method === "GET") return sendJson(res, 200, await crazyCheck());
@@ -1716,139 +1691,141 @@ async function handleAdminApi(req, res, path) {
 
   // ── call log ──
   if (sub === "calls" && req.method === "GET") {
-    if (!db) return sendJson(res, 200, { rows: [], total: 0, dbReady: false });
+    if (!dbUp()) return sendJson(res, 200, { rows: [], total: 0, dbReady: false });
     const q = url.parse(req.url, true).query;
     const where = [], params = [];
-    if (q.provider) { where.push("provider = ?"); params.push(String(q.provider)); }
-    if (q.model) { where.push("req_model = ?"); params.push(String(q.model)); }
-    if (q.key) { where.push("key_label = ?"); params.push(String(q.key)); }
-    if (q.project) { where.push(q.project === "(none)" ? "(project IS NULL OR project = '')" : "project = ?"); if (q.project !== "(none)") params.push(String(q.project).toLowerCase()); }
+    const ph = (v) => { params.push(v); return `$${params.length}`; };   // positional, in push order
+    if (q.provider) where.push(`provider = ${ph(String(q.provider))}`);
+    if (q.model) where.push(`req_model = ${ph(String(q.model))}`);
+    if (q.key) where.push(`key_label = ${ph(String(q.key))}`);
+    if (q.project) where.push(q.project === "(none)" ? "(project IS NULL OR project = '')" : `project = ${ph(String(q.project).toLowerCase())}`);
     if (q.status === "error") where.push("status >= 400");
     else if (q.status === "ok") where.push("status < 400");
-    else if (q.status) { where.push("status = ?"); params.push(parseInt(q.status, 10)); }
-    if (q.since) { where.push("ts >= ?"); params.push(parseInt(q.since, 10)); }
-    if (q.q) { where.push("(req_model LIKE ? OR sent_model LIKE ? OR ip LIKE ? OR ua LIKE ? OR req_content LIKE ? OR resp_content LIKE ?)");
-      const like = "%" + String(q.q) + "%"; params.push(like, like, like, like, like, like); }
+    else if (q.status) where.push(`status = ${ph(parseInt(q.status, 10))}`);
+    if (q.since) where.push(`ts >= ${ph(parseInt(q.since, 10))}`);
+    if (q.q) {
+      const like = ph("%" + String(q.q) + "%");   // one placeholder, reused across the OR
+      where.push(`(req_model ILIKE ${like} OR sent_model ILIKE ${like} OR ip ILIKE ${like}
+        OR ua ILIKE ${like} OR req_content ILIKE ${like} OR resp_content ILIKE ${like})`);
+    }
     const w = where.length ? "WHERE " + where.join(" AND ") : "";
     const limit = Math.min(parseInt(q.limit, 10) || 100, 500);
     const offset = parseInt(q.offset, 10) || 0;
-    try {
-      const total = db.prepare(`SELECT COUNT(*) n FROM calls ${w}`).get(...params).n;
-      // List view: omit big content blobs; send short previews instead.
-      const rows = db.prepare(`SELECT id,ts,ip,ua,method,path,req_model,provider,sent_model,key_label,status,duration_ms,stream,
-        prompt_tokens,completion_tokens,total_tokens,error,project,effort,thinking_tokens,max_tokens,temperature,
-        user_id,cache_read,cache_write,stop_reason,
-        tool_count,mcp_tools,tool_servers,tools_kb,msg_count,system_kb,
-        substr(req_content,1,160) AS req_preview, substr(resp_content,1,200) AS resp_preview
-        FROM calls ${w} ORDER BY id DESC LIMIT ? OFFSET ?`).all(...params, limit, offset);
-      return sendJson(res, 200, { rows, total, limit, offset, dbReady: true });
-    } catch (e) { return sendJson(res, 500, { error: e.message }); }
+    const totalRow = await dbRow(`SELECT COUNT(*)::int AS n FROM calls ${w}`, params);
+    // List view: omit big content blobs; send short previews instead.
+    const rows = await dbRows(`SELECT id,ts,ip,ua,method,path,req_model,provider,sent_model,key_label,status,duration_ms,stream,
+      prompt_tokens,completion_tokens,total_tokens,error,project,effort,thinking_tokens,max_tokens,temperature,
+      user_id,cache_read,cache_write,stop_reason,
+      tool_count,mcp_tools,tool_servers,tools_kb,msg_count,system_kb,
+      left(req_content,160) AS req_preview, left(resp_content,200) AS resp_preview
+      FROM calls ${w} ORDER BY id DESC LIMIT ${ph(limit)} OFFSET ${ph(offset)}`, params);
+    return sendJson(res, 200, { rows, total: totalRow ? totalRow.n : 0, limit, offset, dbReady: true });
   }
   if (sub === "call" && req.method === "GET") {
-    if (!db) return sendJson(res, 404, { error: "no db" });
+    if (!dbUp()) return sendJson(res, 404, { error: "no db" });
     const q = url.parse(req.url, true).query;
     const id = parseInt(q.id, 10);
     if (!id) return sendJson(res, 400, { error: "id required" });
-    try {
-      const row = db.prepare("SELECT * FROM calls WHERE id = ?").get(id);
-      return row ? sendJson(res, 200, row) : sendJson(res, 404, { error: "not found" });
-    } catch (e) { return sendJson(res, 500, { error: e.message }); }
+    const row = await dbRow("SELECT * FROM calls WHERE id = $1", [id]);
+    return row ? sendJson(res, 200, row) : sendJson(res, 404, { error: "not found" });
   }
   // Per-CONVERSATION view: group the log by Claude session_id and surface what's loaded
   // into each chat — MCP servers + tool count, the tool-schema tax (KB), conversation
   // length (messages), token spend, and the account it billed. Answers "which MCP tools
   // is this convo carrying and how long is it". anthropic provider (Claude Code) only.
   if (sub === "conversations" && req.method === "GET") {
-    if (!db) return sendJson(res, 404, { error: "no db" });
+    if (!dbUp()) return sendJson(res, 404, { error: "no db" });
     const q = url.parse(req.url, true).query;
     const limit = Math.min(parseInt(q.limit, 10) || 50, 500);
-    try {
-      const rows = db.prepare(`
-        SELECT json_extract(user_id,'$.session_id') AS session,
-          MAX(project) AS consumer,
-          COUNT(*) AS calls, MAX(msg_count) AS msgs,
-          MAX(tool_count) AS tools, MAX(mcp_tools) AS mcp_tools,
-          MAX(tools_kb) AS tools_kb, MAX(system_kb) AS system_kb,
-          SUM(total_tokens) AS tokens, SUM(cache_read) AS cache_read,
-          SUM(cache_write) AS cache_write,
-          SUM(prompt_tokens - COALESCE(cache_read,0)) AS fresh_in,
-          SUM(completion_tokens) AS out,
-          MIN(ts) AS first_ts, MAX(ts) AS last_ts,
-          SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) AS errors
-        FROM calls
-        WHERE provider IN ('anthropic','claudecode') AND json_extract(user_id,'$.session_id') IS NOT NULL
-        GROUP BY session ORDER BY last_ts DESC LIMIT ?`).all(limit);
-      // latest row per session for the fields that CHANGE over a conversation's life
-      // (the current account it bills + the current MCP server set) — not a lexical MAX.
-      const latest = db.prepare(`SELECT key_label, tool_servers FROM calls
-        WHERE json_extract(user_id,'$.session_id')=? ORDER BY id DESC LIMIT 1`);
-      for (const r of rows) {
-        try { const l = latest.get(r.session) || {}; r.account = l.key_label || null; r.servers = l.tool_servers || null; }
-        catch { r.account = null; r.servers = null; }
-      }
-      return sendJson(res, 200, { conversations: rows, count: rows.length });
-    } catch (e) { return sendJson(res, 500, { error: e.message }); }
+    // `user_id` holds whatever the caller sent; Claude Code stamps a JSON blob, everyone else may
+    // send a bare string. Casting it to jsonb would throw on the first non-JSON row and kill the
+    // whole view, so pull session_id out with a regex, which simply yields NULL when it doesn't match.
+    const SESSION = `substring(user_id from '"session_id"[[:space:]]*:[[:space:]]*"([^"]+)"')`;
+    const rows = await dbRows(`
+      SELECT ${SESSION} AS session,
+        MAX(project) AS consumer,
+        COUNT(*)::int AS calls, MAX(msg_count) AS msgs,
+        MAX(tool_count) AS tools, MAX(mcp_tools) AS mcp_tools,
+        MAX(tools_kb) AS tools_kb, MAX(system_kb) AS system_kb,
+        SUM(total_tokens) AS tokens, SUM(cache_read) AS cache_read,
+        SUM(cache_write) AS cache_write,
+        SUM(prompt_tokens - COALESCE(cache_read,0)) AS fresh_in,
+        SUM(completion_tokens) AS out,
+        MIN(ts) AS first_ts, MAX(ts) AS last_ts,
+        SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END)::int AS errors
+      FROM calls
+      WHERE provider IN ('anthropic','claudecode') AND ${SESSION} IS NOT NULL
+      GROUP BY session ORDER BY last_ts DESC LIMIT $1`, [limit]);
+    // latest row per session for the fields that CHANGE over a conversation's life
+    // (the current account it bills + the current MCP server set) — not a lexical MAX.
+    for (const r of rows) {
+      const l = await dbRow(`SELECT key_label, tool_servers FROM calls
+        WHERE ${SESSION} = $1 ORDER BY id DESC LIMIT 1`, [r.session]);
+      r.account = l ? l.key_label : null;
+      r.servers = l ? l.tool_servers : null;
+    }
+    return sendJson(res, 200, { conversations: rows, count: rows.length });
   }
-  // Full-content export for the NAS archiver (ops/nas-shipper). Cursor by id,
-  // ascending, so a shipper can page id>after until fewer than `limit` return.
-  // Returns FULL req_content/resp_content (unlike `calls`, which previews).
+  // Full-content export. Cursor by id, ascending: page id>after until fewer than `limit` return.
+  // Returns FULL req_content/resp_content (unlike `calls`, which previews). SELECT * on purpose —
+  // an explicit column list silently drops whatever was added to the table since it was written.
   if (sub === "export" && req.method === "GET") {
-    if (!db) return sendJson(res, 404, { error: "no db" });
+    if (!dbUp()) return sendJson(res, 404, { error: "no db" });
     const q = url.parse(req.url, true).query;
     const after = parseInt(q.after, 10) || 0;
     const limit = Math.min(parseInt(q.limit, 10) || 500, 2000);
-    try {
-      // SELECT * on purpose: this is the migration path off this DB, and an explicit column list
-      // silently drops whatever was added since it was written (effort, cache_read/write,
-      // stop_reason, the tool metrics — all missing from the old list).
-      const rows = db.prepare(`SELECT * FROM calls WHERE id > ? ORDER BY id ASC LIMIT ?`).all(after, limit);
-      const maxId = rows.length ? rows[rows.length - 1].id : after;
-      return sendJson(res, 200, { rows, count: rows.length, after, maxId, limit });
-    } catch (e) { return sendJson(res, 500, { error: e.message }); }
+    const rows = await dbRows("SELECT * FROM calls WHERE id > $1 ORDER BY id ASC LIMIT $2", [after, limit]);
+    const maxId = rows.length ? rows[rows.length - 1].id : after;
+    return sendJson(res, 200, { rows, count: rows.length, after, maxId, limit });
   }
   if (sub === "stats" && req.method === "GET") {
-    if (!db) return sendJson(res, 200, { dbReady: false });
+    if (!dbUp()) return sendJson(res, 200, { dbReady: false });
     try {
       const q = url.parse(req.url, true).query;
       // time window: '15m','1h','6h','24h','7d','30d' or 'all'. Default 24h.
       const WINDOWS = { "15m": 900000, "1h": 3600000, "6h": 21600000, "24h": 86400000, "7d": 604800000, "30d": 2592000000 };
       const winKey = (q.window in WINDOWS || q.window === "all") ? q.window : "24h";
       const since = winKey === "all" ? 0 : Date.now() - WINDOWS[winKey];
-      const W = "ts >= ?"; // window predicate, bound to `since`
-      const total = db.prepare("SELECT COUNT(*) n FROM calls").get().n;
-      const windowCalls = db.prepare(`SELECT COUNT(*) n FROM calls WHERE ${W}`).get(since).n;
-      const windowErrors = db.prepare(`SELECT COUNT(*) n FROM calls WHERE ${W} AND status >= 400`).get(since).n;
-      const windowTokens = db.prepare(`SELECT COALESCE(SUM(total_tokens),0) t FROM calls WHERE ${W}`).get(since).t;
-      // json-enforce failures are almost always model refusals (caller asked for JSON, model replied in prose);
-      // surfaced here so the dashboard can flag them as "not a proxy bug" rather than burying them in error count.
-      const windowJsonFails = db.prepare(`SELECT COUNT(*) n FROM calls WHERE ${W} AND error LIKE 'json_validation_failed%'`).get(since).n;
-      const windowPromptTokens = db.prepare(`SELECT COALESCE(SUM(prompt_tokens),0) t FROM calls WHERE ${W}`).get(since).t;
-      const windowCompletionTokens = db.prepare(`SELECT COALESCE(SUM(completion_tokens),0) t FROM calls WHERE ${W}`).get(since).t;
-      const byProvider = db.prepare(`SELECT provider, COUNT(*) n, COALESCE(SUM(total_tokens),0) tok,
-        ROUND(AVG(duration_ms)) avg_ms, SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) errors
-        FROM calls WHERE ${W} GROUP BY provider ORDER BY n DESC`).all(since);
-      const byKey = db.prepare(`SELECT key_label, COUNT(*) n FROM calls WHERE ${W} GROUP BY key_label ORDER BY n DESC`).all(since);
-      // By client (user-agent) — surfaces who's calling: promopilot=Bun, scripts=Python-urllib, and any
-      // Claude Code / anthropic-sdk clients show up here by their UA. thinkers = calls that sent extended
-      // thinking or a reasoning_effort, so you can spot reasoning traffic per client at a glance.
-      const byClient = db.prepare(`SELECT COALESCE(NULLIF(ua,''),'(none)') ua, COUNT(*) n,
-        COALESCE(SUM(total_tokens),0) tok, MAX(ts) last, COUNT(DISTINCT ip) ips,
-        SUM(CASE WHEN effort IS NOT NULL OR (thinking_tokens IS NOT NULL AND thinking_tokens > 0) THEN 1 ELSE 0 END) thinkers,
-        GROUP_CONCAT(DISTINCT provider) providers
-        FROM calls WHERE ${W} GROUP BY COALESCE(NULLIF(ua,''),'(none)') ORDER BY n DESC LIMIT 40`).all(since);
-      const byModel = db.prepare(`SELECT req_model, provider, COUNT(*) n, COALESCE(SUM(total_tokens),0) tok,
-        COALESCE(SUM(prompt_tokens),0) ptok, COALESCE(SUM(completion_tokens),0) ctok, ROUND(AVG(duration_ms)) avg_ms
-        FROM calls WHERE ${W} GROUP BY req_model ORDER BY tok DESC LIMIT 40`).all(since);
-      const byProject = db.prepare(`SELECT COALESCE(NULLIF(project,''),'(none)') project, COUNT(*) n,
-        COALESCE(SUM(total_tokens),0) tok, COALESCE(SUM(prompt_tokens),0) ptok, COALESCE(SUM(completion_tokens),0) ctok,
-        ROUND(AVG(duration_ms)) avg_ms, SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) errors,
-        MAX(ts) last, COUNT(DISTINCT req_model) models, GROUP_CONCAT(DISTINCT provider) providers
-        FROM calls WHERE ${W} GROUP BY COALESCE(NULLIF(project,''),'(none)') ORDER BY tok DESC LIMIT 60`).all(since);
+      const W = "ts >= $1"; const P = [since];
+      // One scan for the window scalars instead of six. Postgres counts `FILTER (WHERE …)` in the
+      // same pass, and this table is now big enough that six separate seq scans is the slow path.
+      const agg = await dbRow(`SELECT
+          COUNT(*)::int AS calls,
+          COUNT(*) FILTER (WHERE status >= 400)::int AS errors,
+          COUNT(*) FILTER (WHERE error LIKE 'json_validation_failed%')::int AS json_fails,
+          COALESCE(SUM(total_tokens),0) AS tokens,
+          COALESCE(SUM(prompt_tokens),0) AS ptok,
+          COALESCE(SUM(completion_tokens),0) AS ctok
+        FROM calls WHERE ${W}`, P) || {};
+      const totalRow = await dbRow("SELECT COUNT(*)::int AS n FROM calls");
+      const byProvider = await dbRows(`SELECT provider, COUNT(*)::int AS n, COALESCE(SUM(total_tokens),0) AS tok,
+        ROUND(AVG(duration_ms)) AS avg_ms, COUNT(*) FILTER (WHERE status>=400)::int AS errors
+        FROM calls WHERE ${W} GROUP BY provider ORDER BY n DESC`, P);
+      const byKey = await dbRows(`SELECT key_label, COUNT(*)::int AS n FROM calls WHERE ${W} GROUP BY key_label ORDER BY n DESC`, P);
+      // By client (user-agent) — surfaces who's calling. thinkers = calls that sent extended thinking
+      // or a reasoning_effort, so you can spot reasoning traffic per client at a glance.
+      // string_agg replaces SQLite's GROUP_CONCAT, which does not exist here.
+      const byClient = await dbRows(`SELECT COALESCE(NULLIF(ua,''),'(none)') AS ua, COUNT(*)::int AS n,
+        COALESCE(SUM(total_tokens),0) AS tok, MAX(ts) AS last, COUNT(DISTINCT ip)::int AS ips,
+        COUNT(*) FILTER (WHERE effort IS NOT NULL OR thinking_tokens > 0)::int AS thinkers,
+        string_agg(DISTINCT provider, ',') AS providers
+        FROM calls WHERE ${W} GROUP BY 1 ORDER BY n DESC LIMIT 40`, P);
+      // MAX(provider): Postgres will not let a bare column ride along outside GROUP BY the way
+      // SQLite does. One row per model is the shape the UI wants, so collapse provider explicitly.
+      const byModel = await dbRows(`SELECT req_model, MAX(provider) AS provider, COUNT(*)::int AS n,
+        COALESCE(SUM(total_tokens),0) AS tok,
+        COALESCE(SUM(prompt_tokens),0) AS ptok, COALESCE(SUM(completion_tokens),0) AS ctok, ROUND(AVG(duration_ms)) AS avg_ms
+        FROM calls WHERE ${W} GROUP BY req_model ORDER BY tok DESC LIMIT 40`, P);
+      const byProject = await dbRows(`SELECT COALESCE(NULLIF(project,''),'(none)') AS project, COUNT(*)::int AS n,
+        COALESCE(SUM(total_tokens),0) AS tok, COALESCE(SUM(prompt_tokens),0) AS ptok, COALESCE(SUM(completion_tokens),0) AS ctok,
+        ROUND(AVG(duration_ms)) AS avg_ms, COUNT(*) FILTER (WHERE status>=400)::int AS errors,
+        MAX(ts) AS last, COUNT(DISTINCT req_model)::int AS models, string_agg(DISTINCT provider, ',') AS providers
+        FROM calls WHERE ${W} GROUP BY 1 ORDER BY tok DESC LIMIT 60`, P);
       // Cost estimate: group by (project, sent_model, provider) to price each cohort, then fold into project/model.
       const prices = priceMap();
-      const costRows = db.prepare(`SELECT COALESCE(NULLIF(project,''),'(none)') project, req_model, sent_model, provider,
-        COALESCE(SUM(prompt_tokens),0) ptok, COALESCE(SUM(completion_tokens),0) ctok
-        FROM calls WHERE ${W} GROUP BY COALESCE(NULLIF(project,''),'(none)'), sent_model, req_model, provider`).all(since);
+      const costRows = await dbRows(`SELECT COALESCE(NULLIF(project,''),'(none)') AS project, req_model, sent_model, provider,
+        COALESCE(SUM(prompt_tokens),0) AS ptok, COALESCE(SUM(completion_tokens),0) AS ctok
+        FROM calls WHERE ${W} GROUP BY 1, sent_model, req_model, provider`, P);
       let windowCost = 0; const costByProject = {}, costByModel = {};
       for (const r of costRows) {
         const c = costUsd(prices, r.sent_model, r.provider, r.ptok, r.ctok);
@@ -1856,23 +1833,26 @@ async function handleAdminApi(req, res, path) {
         costByProject[r.project] = (costByProject[r.project] || 0) + c;
         costByModel[r.req_model] = (costByModel[r.req_model] || 0) + c;
       }
-      byProject.forEach((r) => {
+      for (const r of byProject) {
         r.usd = +(costByProject[r.project] || 0).toFixed(4);
         // attach the effective limit + live usage% over the limit's own window (not the stats window)
         const lim = r.project && r.project !== "(none)" ? limitFor(r.project) : null;
         if (lim) {
-          const u = projectUsage(r.project, WINDOW_MS[lim.window] || WINDOW_MS["24h"]);
+          const u = await projectUsage(r.project, WINDOW_MS[lim.window] || WINDOW_MS["24h"]);
           const pt = lim.tokens > 0 ? u.tokens / lim.tokens : 0, pc = lim.calls > 0 ? u.calls / lim.calls : 0;
           r.limit = { window: lim.window, tokens: lim.tokens, calls: lim.calls, hard: lim.hard, warnPct: lim.warnPct, slowPct: lim.slowPct };
           r.limitUsed = { tokens: u.tokens, calls: u.calls };
           r.limitPct = +(Math.max(pt, pc) * 100).toFixed(1);
         }
-      });
+      }
       byModel.forEach((r) => { r.usd = +(costByModel[r.req_model] || 0).toFixed(4); });
-      const oldest = db.prepare("SELECT MIN(ts) t FROM calls").get().t;
-      return sendJson(res, 200, { dbReady: true, window: winKey, total, windowCalls, windowErrors, windowTokens,
-        windowPromptTokens, windowCompletionTokens, windowJsonFails, windowCost: +windowCost.toFixed(4),
-        pricedProviders: ["crazyrouter"], byProvider, byKey, byClient, byModel, byProject, oldest, retain: CFG.logging.retain });
+      const oldestRow = await dbRow("SELECT MIN(ts) AS t FROM calls");
+      return sendJson(res, 200, { dbReady: true, window: winKey, total: totalRow ? totalRow.n : 0,
+        windowCalls: agg.calls || 0, windowErrors: agg.errors || 0, windowTokens: agg.tokens || 0,
+        windowPromptTokens: agg.ptok || 0, windowCompletionTokens: agg.ctok || 0, windowJsonFails: agg.json_fails || 0,
+        windowCost: +windowCost.toFixed(4),
+        pricedProviders: ["crazyrouter"], byProvider, byKey, byClient, byModel, byProject,
+        oldest: oldestRow ? oldestRow.t : null, retain: CFG.logging.retain });
     } catch (e) { return sendJson(res, 500, { error: e.message }); }
   }
 
@@ -1880,21 +1860,24 @@ async function handleAdminApi(req, res, path) {
   // ?window=…&by=provider|project|model. Buckets auto-sized to ~60 points across the
   // window. Returns top series by total tokens (rest folded into "other").
   if (sub === "series" && req.method === "GET") {
-    if (!db) return sendJson(res, 200, { dbReady: false });
+    if (!dbUp()) return sendJson(res, 200, { dbReady: false });
     try {
       const q = url.parse(req.url, true).query;
       const WINDOWS = { "15m": 900000, "1h": 3600000, "6h": 21600000, "24h": 86400000, "7d": 604800000, "30d": 2592000000 };
       const winKey = (q.window in WINDOWS || q.window === "all") ? q.window : "24h";
       const by = ["provider", "project", "model"].includes(q.by) ? q.by : "provider";
       const groupCol = by === "provider" ? "provider" : by === "model" ? "req_model" : "COALESCE(NULLIF(project,''),'(none)')";
-      const oldest = db.prepare("SELECT MIN(ts) t FROM calls").get().t || Date.now();
+      const oldestRow = await dbRow("SELECT MIN(ts) AS t FROM calls");
+      const oldest = (oldestRow && oldestRow.t) || Date.now();
       const span = winKey === "all" ? Math.max(60000, Date.now() - oldest) : WINDOWS[winKey];
       const since = winKey === "all" ? oldest : Date.now() - span;
       // bucket width: aim for ~60 buckets, snapped to a sane floor of 1 minute.
+      // bucketMs is derived here, never caller-supplied, so interpolating it is not an injection path.
       const bucketMs = Math.max(60000, Math.round(span / 60 / 60000) * 60000);
-      const rows = db.prepare(`SELECT (ts/${bucketMs}) b, ${groupCol} g,
-        COUNT(*) n, COALESCE(SUM(total_tokens),0) tok, SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) err
-        FROM calls WHERE ts >= ? GROUP BY b, g`).all(since);
+      const rows = await dbRows(`SELECT (ts/${bucketMs}) AS b, ${groupCol} AS g,
+        COUNT(*)::int AS n, COALESCE(SUM(total_tokens),0) AS tok,
+        COUNT(*) FILTER (WHERE status>=400)::int AS err
+        FROM calls WHERE ts >= $1 GROUP BY b, g`, [since]);
       // top-8 series by total tokens; everything else → "other".
       const totals = {}; for (const r of rows) totals[r.g] = (totals[r.g] || 0) + r.tok;
       const top = Object.entries(totals).sort((a, b2) => b2[1] - a[1]).slice(0, 8).map(([k]) => k);
@@ -1915,9 +1898,12 @@ async function handleAdminApi(req, res, path) {
   }
 
   if (sub === "calls/clear" && req.method === "POST") {
-    if (!db) return sendJson(res, 200, { ok: true, dbReady: false });
-    try { db.exec("DELETE FROM calls;"); console.log(`[admin] call log cleared ip=${ip}`); return sendJson(res, 200, { ok: true }); }
-    catch (e) { return sendJson(res, 500, { error: e.message }); }
+    if (!dbUp()) return sendJson(res, 200, { ok: true, dbReady: false });
+    try {
+      await pool.query("DELETE FROM calls");
+      console.log(`[admin] call log cleared ip=${ip}`);
+      return sendJson(res, 200, { ok: true });
+    } catch (e) { return sendJson(res, 500, { error: e.message }); }
   }
 
   return sendJson(res, 404, { error: "unknown admin endpoint" });
@@ -2010,7 +1996,7 @@ const server = http.createServer(async (req, res) => {
   // Per-project usage limits (rolling-window quota): warn → slow (throttle) → block (429).
   // Headers set here survive proxy/jsonEnforce writeHead (Node merges setHeader values).
   if (isInference && project) {
-    const v = usageVerdict(project);
+    const v = await usageVerdict(project);
     if (v) {
       const pctI = Math.round(v.pct * 100), capStr = v.lim.tokens > 0 ? `${v.lim.tokens.toLocaleString()} tok` : `${v.lim.calls.toLocaleString()} calls`;
       res.setHeader("x-usage-percent", String(pctI));

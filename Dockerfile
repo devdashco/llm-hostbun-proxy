@@ -1,6 +1,10 @@
 FROM node:24-alpine
 RUN apk add --no-cache curl jq
 WORKDIR /app
+# Deps first, so a code-only change reuses this layer. `pg` is the router's ONLY runtime dependency:
+# the call log lives in the llmrouter Postgres, not in a file on the container's volume.
+COPY package.json package-lock.json /app/
+RUN npm ci --omit=dev
 COPY server.js /app/server.js
 COPY translate.js /app/translate.js
 COPY docs /srv/docs

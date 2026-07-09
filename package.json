@@ -1,0 +1,17 @@
+{
+  "name": "llm-hostbun-router",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Single-URL OpenAI-compatible LLM router behind llm.hostbun.cc",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node translate.test.js"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

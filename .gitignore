@@ -1,4 +1,5 @@
 prices.json
+node_modules/
 .headroom-venv/
 __pycache__/
 *.pyc
