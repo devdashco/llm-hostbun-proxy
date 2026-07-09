@@ -140,6 +140,15 @@ dependency, the lockfile must be committed or the build fails.
 - **`defaultAccount` quietly voids the "never bill a guess" invariant.** `accountFor()` is
   `pins[project] || defaultAccount`, so an unpinned *or misspelled* project bills the default instead
   of 403'ing. The 403 works today only because `defaultAccount` is empty in prod. Leave it empty.
+- **Anthropic serves ids it does not list.** `/v1/models` shows dated ids for the 4.5 family and
+  undated ids for 4.6+. The undated 4.5 forms (`claude-haiku-4-5`, `claude-sonnet-4-5`,
+  `claude-opus-4-5`) are served but unlisted — and `claude-haiku-4-5` is what every caller sends.
+  They live in `CLAUDECODE_MODEL_ALIASES`. **Do not derive them by stripping the date**:
+  `claude-opus-4-1` 404s while `claude-opus-4-1-20250805` serves, and `claude-opus-4-8-20260528`
+  404s while undated `claude-opus-4-8` serves. Verify each with `claudecode/probe` — a **404 means
+  the id does not exist**; a **429 means it exists and the subscription is dry**.
+- **Everything before 4.5 is 404 on a Max OAuth token** (`claude-3-*`, `claude-3-5-*`, `opus-4`,
+  `sonnet-4`). Not missing from our catalog — not ours to call. Don't go looking for them.
 - **`claudecodeModels` is no longer hand-typed.** `CLAUDECODE_MODEL_SEED` in `server.js` is a floor;
   `refreshClaudecodeModels()` reconciles it against `api.anthropic.com/v1/models` at boot and every 6h,
   and the config load *unions* rather than overwrites. **The catalog is per-account** — `philip` lists
