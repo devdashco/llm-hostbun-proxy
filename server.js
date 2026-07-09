@@ -449,6 +449,11 @@ function initDb() {
     const { DatabaseSync } = require("node:sqlite");
     fs.mkdirSync(path.dirname(CALLS_DB), { recursive: true });
     db = new DatabaseSync(CALLS_DB);
+    // busy_timeout FIRST: a rolling deploy overlaps the old and new containers on the same volume,
+    // so the outgoing process still holds the file. `PRAGMA journal_mode=WAL` is itself a write and
+    // throws SQLITE_BUSY without this — which used to abort initDb and disable logging for the whole
+    // life of the container. Wait for the old process to let go instead of giving up.
+    db.exec("PRAGMA busy_timeout=15000;");
     db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
     db.exec(`CREATE TABLE IF NOT EXISTS calls (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -487,12 +492,27 @@ function initDb() {
     // Add the column, then backfill it from `lane` so old rows keep their provider attribution
     // (retention prunes by provider name, so an unbackfilled row would look like a NULL provider).
     try { db.exec("ALTER TABLE calls ADD COLUMN provider TEXT;"); } catch { /* already there */ }
-    try { db.exec("UPDATE calls SET provider = lane WHERE provider IS NULL;"); } catch { /* no legacy `lane` column — fresh DB */ }
-    db.exec("CREATE INDEX IF NOT EXISTS idx_calls_ts ON calls(ts);");
-    db.exec("CREATE INDEX IF NOT EXISTS idx_calls_model ON calls(req_model);");
-    db.exec("CREATE INDEX IF NOT EXISTS idx_calls_provider ON calls(provider);");
-    db.exec("CREATE INDEX IF NOT EXISTS idx_calls_project ON calls(project);");
-    db.exec("CREATE INDEX IF NOT EXISTS idx_calls_project_ts ON calls(project, ts);"); // per-project usage windows
+    // Backfill only when there is something to backfill: a full-table UPDATE on a large prod log is
+    // an expensive write to run on every single boot. Skipped entirely once `lane` is gone or drained.
+    try {
+      const hasLane = db.prepare("SELECT COUNT(*) n FROM pragma_table_info('calls') WHERE name='lane'").get().n > 0;
+      if (hasLane) {
+        const stale = db.prepare("SELECT COUNT(*) n FROM calls WHERE provider IS NULL AND lane IS NOT NULL").get().n;
+        if (stale > 0) {
+          db.exec("UPDATE calls SET provider = lane WHERE provider IS NULL;");
+          console.log(`[log] migrated ${stale} pre-rename row(s): lane → provider`);
+        }
+      }
+    } catch (e) { console.warn(`[log] provider backfill skipped: ${e.message}`); }
+    // Index creation must never be fatal. An index is an optimisation; losing one is a slow query,
+    // but letting it throw here costs the entire call log.
+    for (const ix of [
+      "CREATE INDEX IF NOT EXISTS idx_calls_ts ON calls(ts);",
+      "CREATE INDEX IF NOT EXISTS idx_calls_model ON calls(req_model);",
+      "CREATE INDEX IF NOT EXISTS idx_calls_provider ON calls(provider);",
+      "CREATE INDEX IF NOT EXISTS idx_calls_project ON calls(project);",
+      "CREATE INDEX IF NOT EXISTS idx_calls_project_ts ON calls(project, ts);", // per-project usage windows
+    ]) { try { db.exec(ix); } catch (e) { console.warn(`[log] index skipped: ${e.message}`); } }
     try { db.exec("CREATE INDEX IF NOT EXISTS idx_calls_user ON calls(user_id);"); } catch { /* col may not exist on very old dbs mid-migrate */ }
     insertStmt = db.prepare(`INSERT INTO calls
       (ts,ip,ua,method,path,req_model,provider,sent_model,key_label,status,duration_ms,stream,prompt_tokens,completion_tokens,total_tokens,error,req_content,resp_content,project,effort,thinking_tokens,max_tokens,temperature,user_id,cache_read,cache_write,stop_reason,tool_count,mcp_tools,tool_servers,tools_kb,msg_count,system_kb)
