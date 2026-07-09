@@ -1798,10 +1798,10 @@ async function handleAdminApi(req, res, path) {
     const after = parseInt(q.after, 10) || 0;
     const limit = Math.min(parseInt(q.limit, 10) || 500, 2000);
     try {
-      const rows = db.prepare(`SELECT id,ts,ip,ua,method,path,req_model,provider,sent_model,key_label,
-        status,duration_ms,stream,prompt_tokens,completion_tokens,total_tokens,error,project,
-        req_content,resp_content
-        FROM calls WHERE id > ? ORDER BY id ASC LIMIT ?`).all(after, limit);
+      // SELECT * on purpose: this is the migration path off this DB, and an explicit column list
+      // silently drops whatever was added since it was written (effort, cache_read/write,
+      // stop_reason, the tool metrics — all missing from the old list).
+      const rows = db.prepare(`SELECT * FROM calls WHERE id > ? ORDER BY id ASC LIMIT ?`).all(after, limit);
       const maxId = rows.length ? rows[rows.length - 1].id : after;
       return sendJson(res, 200, { rows, count: rows.length, after, maxId, limit });
     } catch (e) { return sendJson(res, 500, { error: e.message }); }
