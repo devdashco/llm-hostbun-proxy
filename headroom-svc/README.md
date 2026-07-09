@@ -2,7 +2,7 @@
 
 Tiny HTTP sidecar that runs [headroom](https://github.com/chopratejas/headroom)
 context compression on a list of chat messages. Deployed as its **own** Coolify
-app next to `llm-hostbun-proxy`; the proxy calls it before forwarding upstream.
+app next to `llm-hostbun-router`; the proxy calls it before forwarding upstream.
 
 It is **not** an LLM proxy — it never talks to a model. It takes messages in,
 runs `headroom.compress()`, returns the (shorter) messages + stats.
@@ -43,7 +43,7 @@ uv pip install --python .venv -r requirements.txt
 
 ## Deploy (Coolify)
 
-New application, same repo (`devdashco/llm-hostbun-proxy`), **Base Directory**
+New application, same repo (`devdashco/llm-hostbun-router`), **Base Directory**
 `/headroom-svc`, Dockerfile build pack. No public domain needed — the proxy
 reaches it over the internal Docker network. Point the proxy at it with
 `HEADROOM_URL=http://<service-host>:8000`.

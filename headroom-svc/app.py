@@ -4,7 +4,7 @@ POST /compress  { messages, model?, model_limit?, ...opts }  -> { messages, stat
 GET  /health
 
 This is NOT a full LLM proxy. It only runs headroom's compression pipeline on a
-list of messages and hands the (possibly shorter) list back. The llm-hostbun-proxy
+list of messages and hands the (possibly shorter) list back. The llm-hostbun-router
 calls it before forwarding a request upstream, then forwards the compressed body.
 
 Any failure returns the messages unchanged (passthrough) so the proxy never breaks

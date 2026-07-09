@@ -8,24 +8,24 @@
   ],
   "links": [
     {
-      "group": "This repo \u2014 devdashco/llm-hostbun-proxy",
+      "group": "This repo \u2014 devdashco/llm-hostbun-router",
       "name": "Repo",
-      "url": "https://github.com/devdashco/llm-hostbun-proxy"
+      "url": "https://github.com/devdashco/llm-hostbun-router"
     },
     {
-      "group": "This repo \u2014 devdashco/llm-hostbun-proxy",
+      "group": "This repo \u2014 devdashco/llm-hostbun-router",
       "name": "Issues",
-      "url": "https://github.com/devdashco/llm-hostbun-proxy/issues"
+      "url": "https://github.com/devdashco/llm-hostbun-router/issues"
     },
     {
-      "group": "This repo \u2014 devdashco/llm-hostbun-proxy",
+      "group": "This repo \u2014 devdashco/llm-hostbun-router",
       "name": "PRs",
-      "url": "https://github.com/devdashco/llm-hostbun-proxy/pulls"
+      "url": "https://github.com/devdashco/llm-hostbun-router/pulls"
     },
     {
-      "group": "This repo \u2014 devdashco/llm-hostbun-proxy",
+      "group": "This repo \u2014 devdashco/llm-hostbun-router",
       "name": "Actions",
-      "url": "https://github.com/devdashco/llm-hostbun-proxy/actions"
+      "url": "https://github.com/devdashco/llm-hostbun-router/actions"
     }
   ]
 }

@@ -92,4 +92,4 @@ retire: `claude.hostbun.cc` (+docs), `docs.llm.hostbun.cc`, `i7pf…hostbun.cc`
 - `claudectl/integrations/lprod-telegram/accounts.json` held live `sk-ant-oat01` tokens
   and was tracked → **untracked + gitignored** (`a9eef78`). **Tokens are in history →
   rotate them** and move the pool to keyvault.
-- `llm-hostbun-proxy` was **public** → set **private**. No hardcoded secrets in `server.js`.
+- `llm-hostbun-router` was **public** → set **private**. No hardcoded secrets in `server.js`.

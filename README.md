@@ -1,4 +1,4 @@
-# llm-hostbun-proxy
+# llm-hostbun-router
 
 Single-URL OpenAI-compatible LLM router behind `llm.hostbun.cc` (Node, zero deps beyond
 built-ins; deployed on hostbun Coolify). One base URL — `https://llm.hostbun.cc/v1` — picks
