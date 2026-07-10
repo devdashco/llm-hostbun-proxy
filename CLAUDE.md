@@ -25,11 +25,12 @@ refs may still linger in sibling repos.
 - **`CFG` is mutated in place, never reassigned** (`setCFG()`). Every module holds the same reference;
   `CFG = merged` left the router reading a detached copy — the panel saved and changed nothing.
 - `translate.js` — OpenAI ↔ Anthropic translation. Pure, unit-tested.
-- `admin/` — password-gated SPA (Preact + htm, vendored, no CDN). pw `ddash`. `index.html` is a 14-line
-  shell; the app is ES modules under `admin/ui/` (`core.js`, `app.js`, `drawer.js`, `pages/*.js`),
-  served by the router at `/ui/*` (extension-allowlisted, no traversal). Served at the site **root**
-  `/` — there is no `/admin` page (it 308s to `/`). The JSON API keeps the `/admin/api/*` prefix
-  because `claudectl` hardcodes it; `/api/*` is the alias the SPA itself uses.
+- `admin/` — password-gated SPA (Preact + htm, vendored inline, no CDN). pw `ddash`. Served at the
+  site **root** `/`. **There is no `/admin` anything** — the prefix was deleted on 2026-07-10 and
+  `/admin*` is a tombstone 404. The JSON control plane is `/api/*`. claudectl, the statusline and the
+  `cccc` TUI were repointed first (claudectl `ba3a6bf`). Two carve-outs are load-bearing: `/api/v1/*`
+  is real inference (`base_url=…/api`) and `/api/pricing` is public — routing either into the
+  cookie-gated handler 401s callers that never had a cookie.
 
 - `docs/` — **docsify** site: `index.html` shell + markdown pages + `_sidebar.md`, docsify vendored in
   `docs/vendor/` (no CDN, `noEmoji: true` because emoji shortcodes fetch images from githubassets).
@@ -132,7 +133,33 @@ These are load-bearing decisions, not oversights. Each one was a bug once.
    breaks Claude Code's prompt cache.
 6. **Model ids are config, never code** (`claudecodeModels`). Anthropic ships new ids without asking.
 
-## Identity — consumers, jobs, keys
+## Identity — developers, machines, projects
+
+**Three entities, and the rules are enforced by Postgres, not by application code.**
+
+| entity | what it is | has an owner? |
+|---|---|---|
+| `developer` | a person — `philip`, `william` | — |
+| `machine` | a person's box, or a daemon on it — `pmac`, `wmac`, `pbox`, `lprod` | **yes**, a developer |
+| `project` | code we deployed — `promopilot`, `redbut` | **no** — an app is not a person |
+
+Machines and projects share ONE table, `consumers`, with one UNIQUE name: both are *callers*, both
+appear on the wire as `<name>[:<job>]`, both can hold a key. Two tables would be two namespaces and
+`pmac` could exist as both. `kind` distinguishes them; a CHECK constraint enforces "a project has no
+owner"; `developer_id` is `ON DELETE RESTRICT`. Verified by inserting directly, bypassing the API.
+
+**`src/registry.js` is the ONLY writer.** The DB is the source of truth; `refresh()` projects it into
+`CFG` (what requests read) and mirrors it to `/data/config.json` (so a cold boot with the DB down
+still authenticates). `authenticate()` never touches Postgres.
+
+**A registry write with no DB refuses with 503.** It used to write `CFG` — the legacy
+`POST /api/consumers/keys` issued a key that authenticated until the next registry write and then
+silently vanished (reproduced 2026-07-10, fixed in `c385a5e`). Pure validation still answers without a
+DB, so a caller's error is about their request, not our infrastructure.
+
+**Keys live in keyvault** at `llm/<consumer>/API_KEY`, one per consumer, issued 2026-07-10.
+
+## Identity — the wire format
 
 **A consumer is WHO calls.** Exactly two kinds, and they are not the same thing:
 
@@ -226,8 +253,11 @@ the container crash-loops on boot.
 
 Two very different things, and only one of them is a database.
 
-**The call log lives in Postgres** — database `llmrouter` on the pbox cluster, reached via
-`DATABASE_URL` (set in Coolify env, never in git). Tables `calls` and `acct_limits`, created by
+**The call log AND the identity registry live in Postgres** — database `llmrouter`, a Coolify
+standalone-postgres (`postgres:17-alpine`, uuid `b8ubtmws8mnt8viw9mg0syz2`) **inside the
+`llm-hostbun-router` project on hostbun**, reached over the internal `coolify` docker network.
+Moved off pbox on 2026-07-10 (it was `80.217.106.60:5435`, `sslmode=disable`, cleartext over the
+public internet). DSN in keyvault at `db/llmrouter/DATABASE_URL`. Tables `calls` and `acct_limits`, created by
 migration `0001_calls_and_acct_limits`. It used to be a SQLite file on the app's volume; that file is
 gone. `pg` is the router's only runtime dependency, so the Dockerfile now runs `npm ci` — if you add a
 dependency, the lockfile must be committed or the build fails.
@@ -239,11 +269,10 @@ dependency, the lockfile must be committed or the build fails.
 - **The account tokens exist in exactly one place**: `anthropicPool` / `claudecodeAccountPool` inside
   `/data/config.json` on the app's volume. Not in env, not in git, no backup. Lose the volume, lose
   the subscriptions. Back it up before touching the app, the server, or the volume.
-- **The Postgres link is not encrypted.** The pbox cluster answers `The server does not support SSL
-  connections`, so `sslmode=disable` is not a shortcut, it is the only option today. The router is on
-  hostbun and the DB is on pbox, so **every prompt and every reply crosses the public internet in
-  cleartext**, and so does the DB password. Fix by fronting Postgres with TLS or routing over the
-  `pbox-proxy-tunnel`. Until then, `logging.content = false` is the blunt mitigation.
+- **The Postgres link no longer crosses the internet.** It used to: the DB was on pbox, the router on
+  hostbun, `sslmode=disable`, so every prompt, every reply and the DB password went out in cleartext.
+  Since 2026-07-10 the DB is a Coolify resource in the same project, on the same box, reachable only on
+  the internal `coolify` network. **Do not point `DATABASE_URL` back at a remote host without TLS.**
 - **`pg` returns BIGINT as a string.** Every `ts`, `id` and `SUM()` in this schema is a bigint. Left
   unparsed they break timestamp arithmetic and the shapes the admin UI expects. `server.js` installs
   type parsers for oid 20 (int8) and 1700 (numeric) at boot; don't remove them.
