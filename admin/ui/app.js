@@ -31,10 +31,13 @@ function Shell({slug,go,children}){
       </nav>
       <div class="sb-foot"><button class="ghost sm" style="width:100%" onClick=${async()=>{ try{await api('logout',{method:'POST'});}catch{} location.reload(); }}>Sign out</button></div>
     </aside>
+    ${sbOpen&&html`<div class="dov open" style="z-index:49" onClick=${()=>setSbOpen(false)}></div>`}
     <div class="main">
+      ${/* Mobile only. On desktop the sidebar carries the brand and <PageHead/> carries the title,
+           so a second bar repeating the page name is chrome with nothing to say. */''}
       <header class="topbar">
-        <button class="ghost sm hamb" onClick=${()=>setSbOpen(!sbOpen)}>☰</button>
-        <span class="crumb">hostbun <span style="opacity:.5">/</span></span><h2 style="font-size:16px">${nameFor(slug)}</h2>
+        <button class="ghost sm" onClick=${()=>setSbOpen(!sbOpen)} aria-label="menu">☰</button>
+        <h3>${nameFor(slug)}</h3>
       </header>
       <div class="content">${children}</div>
     </div>
@@ -46,14 +49,15 @@ function Login({onOk}){
   const [pw,setPw]=useState(''); const [err,setErr]=useState('');
   async function submit(){ setErr(''); try{ await api('login',{method:'POST',body:JSON.stringify({password:pw})}); onOk(); }catch(e){ setErr(e.message); } }
   return html`<div class="login">
-    <div class="sb-brand" style="justify-content:center;border:0;margin:0 0 8px;padding:0"><div class="logo">hb</div></div>
-    <h1 style="font-size:20px">llm.hostbun.cc</h1>
-    <p class="mut">control panel</p>
+    <div class="sb-brand"><div class="logo">hb</div></div>
+    <h1>llm.hostbun.cc</h1>
+    <p class="hint">Control panel for the router. Every model call we make goes through it.</p>
     <div class="card">
-      <input type="password" placeholder="password" autofocus value=${pw} onInput=${e=>setPw(e.target.value)} onKeyDown=${e=>e.key==='Enter'&&submit()}/>
-      <div style="height:10px"></div>
+      <label for="pw" style="margin-top:0">Password</label>
+      <input id="pw" type="password" placeholder="••••••" autofocus value=${pw} onInput=${e=>setPw(e.target.value)} onKeyDown=${e=>e.key==='Enter'&&submit()}/>
+      <div style="height:12px"></div>
       <button style="width:100%" onClick=${submit}>Sign in</button>
-      ${err&&html`<p class="down" style="margin:10px 0 0;font-size:13px">${err}</p>`}
+      ${err&&html`<p class="down" style="margin:12px 0 0;font-size:13px">${err}</p>`}
     </div>
   </div>`;
 }

@@ -21,15 +21,24 @@ function toast(msg,bad){ const t=document.getElementById('toast'); t.textContent
 const clone = o => JSON.parse(JSON.stringify(o==null?{}:o));
 const nfmt = n => { n=+n||0; if(n>=1e9)return (n/1e9).toFixed(2)+'B'; if(n>=1e6)return (n/1e6).toFixed(2)+'M'; if(n>=1e3)return (n/1e3).toFixed(1)+'k'; return ''+Math.round(n); };
 const usd = n => { n=+n||0; if(n===0)return '$0'; if(n<0.01)return '<$0.01'; return '$'+n.toFixed(n<10?2:0); };
-const ago = ts => { if(!ts)return '—'; const s=(Date.now()-ts)/1000; if(s<60)return Math.round(s)+'s'; if(s<3600)return Math.round(s/60)+'m'; if(s<86400)return Math.round(s/3600)+'h'; return Math.round(s/86400)+'d'; };
+// One `ago`. Four pages used to carry their own, each with a different idea of what "never" looks
+// like. `now` is a parameter because /accounts clocks relative to the server, not the browser.
+const ago = (ts,now) => { if(!ts)return '—'; const s=((now||Date.now())-ts)/1000;
+  if(s<60)return Math.max(0,Math.round(s))+'s'; if(s<3600)return Math.round(s/60)+'m';
+  if(s<86400)return Math.round(s/3600)+'h'; return Math.round(s/86400)+'d'; };
 const fmtMs = ms => { if(ms==null)return '—'; return ms>=1000?(ms/1000).toFixed(ms>=10000?0:1)+'s':Math.round(ms)+'ms'; };
 const fmtTime = ts => new Date(ts).toISOString().replace('T',' ').slice(5,19);
 const SLOW_MS = 30000;
 // Legacy provider names still present in old call-log rows (wrappy/claude/anthropic → claudecode,
 // cloud → crazyrouter) map onto the canonical pill so history renders the same as new traffic.
 const providerCls = {local:'local',crazyrouter:'crazyrouter',claudecode:'claudecode',cloud:'crazyrouter',claude:'claudecode',anthropic:'claudecode',wrappy:'claudecode',blocked:'down',images:'images'};
-const PALETTE = ['#3b82f6','#22c55e','#f97316','#f59e0b','#a855f7','#ef4444','#06b6d4','#eab308','#84cc16','#ec4899'];
-const PROVIDER_COLOR = {local:'#22c55e',crazyrouter:'#3b82f6',claudecode:'#f97316',anthropic:'#f97316',blocked:'#ef4444',images:'#a855f7'};
+// Chart colours are the same OKLCH tokens app.css declares; SVG fill takes oklch() directly. A
+// series painted from a different palette than its pill is a series the eye cannot follow.
+const OK = 'oklch(0.740 0.160 152)', WARN = 'oklch(0.800 0.140 78)', DANGER = 'oklch(0.645 0.205 25)';
+const ACCENT = 'oklch(0.660 0.135 252)', ORANGE = 'oklch(0.730 0.160 52)', VIOLET = 'oklch(0.680 0.180 300)';
+const GRID = 'oklch(0.278 0.006 285)', AXIS = 'oklch(0.560 0.010 285)';
+const PALETTE = [ACCENT,OK,ORANGE,WARN,VIOLET,DANGER,'oklch(0.72 0.12 210)','oklch(0.80 0.15 100)','oklch(0.78 0.16 130)','oklch(0.68 0.19 350)'];
+const PROVIDER_COLOR = {local:OK,crazyrouter:ACCENT,claudecode:ORANGE,anthropic:ORANGE,blocked:DANGER,images:VIOLET};
 const seriesColor = (name,i) => PROVIDER_COLOR[name]||PALETTE[i%PALETTE.length];
 
 /* ───────── icons ───────── */
@@ -41,6 +50,8 @@ const ICON = {
   box:'<path d="M12 2 3 7v10l9 5 9-5V7z"/><path d="M3 7l9 5 9-5"/><path d="M12 12v10"/>',
   cloud:'<path d="M17.5 19a4.5 4.5 0 0 0 0-9 6 6 0 0 0-11.6 1.6A3.5 3.5 0 0 0 6.5 19z"/>',
   key:'<circle cx="8" cy="15" r="4"/><path d="M10.85 12.15 19 4M18 5l2 2M15 6l2 2"/>',
+  users:'<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+  lock:'<rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
 };
 const Svg = ({n}) => html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" dangerouslySetInnerHTML=${{__html:ICON[n]||''}}></svg>`;
 
@@ -48,45 +59,56 @@ const NAV = [
   {sec:'Monitor'},
   {name:'Overview',slug:'overview',icon:'grid'},
   {name:'Calls',slug:'calls',icon:'list'},
-  {name:'Consumers',slug:'consumers',icon:'chart'},
   {name:'Stats',slug:'stats',icon:'chart'},
-  {name:'Accounts',slug:'accounts',icon:'key'},
   {sec:'Control'},
+  {name:'Consumers',slug:'consumers',icon:'users'},
+  {name:'Accounts',slug:'accounts',icon:'key'},
   {name:'Routing',slug:'routing',icon:'route'},
   {name:'Models & test',slug:'models',icon:'box'},
-  {sec:'Cloud & keys'},
+  {sec:'Settings'},
   {name:'Crazyrouter',slug:'crazyrouter',icon:'cloud'},
-  {name:'Secrets',slug:'secrets',icon:'key'},
+  {name:'Secrets',slug:'secrets',icon:'lock'},
 ];
 const BASE='';   // the panel lives at the site root; there is no /admin path any more
 const slugFor = n => (NAV.find(x=>x.name===n)||{}).slug||'overview';
 const nameFor = s => (NAV.find(x=>x.slug===s)||{}).name||'Overview';
 
-/* ───────── shared UI atoms ───────── */
-const Pill = ({cls,children}) => html`<span class="pill ${cls||''}">${children}</span>`;
+/* ───────── shared UI atoms ─────────
+   Everything on this surface is one of five things: a badge, a stat, a section, a tab strip, or a
+   table. A page that needs a sixth adds it here, so the vocabulary stays the same screen to screen. */
+const Pill = ({cls,title,style,children}) => html`<span class="pill ${cls||''}" title=${title} style=${style}>${children}</span>`;
+const Chip = ({cls,title,style,children}) => html`<span class="chip ${cls||''}" title=${title} style=${style}>${children}</span>`;
+const Dot = ({color}) => html`<span class="dot" style=${`background:${color}`}></span>`;
 const ProviderPill = ({provider}) => html`<${Pill} cls=${providerCls[provider]||''}>${provider||'?'}<//>`;
+/* A JSON-enforcement refusal is a 4xx the caller provoked, not an outage. It reads amber, and the
+   distinction is carried by colour + tooltip rather than an emoji the eye has to decode. */
 const StatusPill = ({status,error}) => {
   const refusal = status>=400 && /^json_validation_failed/.test(error||'');
-  if(refusal) return html`<${Pill} cls="warnp">🙅 ${status}<//>`;
+  if(refusal) return html`<${Pill} cls="warnp" title="JSON enforcement refusal — usually a prose answer, not a proxy fault">${status}<//>`;
   if(status>=400) return html`<${Pill} cls="down">${status}<//>`;
   return html`<${Pill} cls="up">${status||'—'}<//>`;
 };
 const KV = ({n,children}) => html`<div class="kv"><div class="n">${n}</div><div class="v">${children}</div></div>`;
 const Card = ({cls,children}) => html`<div class="card ${cls||''}">${children}</div>`;
-// Reasoning params surfaced per call: 🧠 effort (low/med/high), 💭 extended-thinking budget (or "off").
+/* Section header: title, one line of why-it-matters, and the actions that belong to it. */
+const CardHead = ({title,hint,actions}) => html`<div class="card-hd">
+  <div style="min-width:0"><h3>${title}</h3>${hint&&html`<small class="hint">${hint}</small>`}</div>
+  ${actions&&html`<div class="acts">${actions}</div>`}
+</div>`;
+/* Per-call request params. Labelled, not pictographic: `cache↓ 12k` survives a screenshot, ⚡ 12k does not. */
 const ParamBadges = ({r}) => {
   const b=[];
-  if(r.effort) b.push(html`<span class="chip" title="reasoning effort" style="border-color:var(--amb);color:var(--amb)">🧠 ${r.effort}</span>`);
-  if(r.thinking_tokens>0) b.push(html`<span class="chip" title="extended thinking budget (tokens)" style="border-color:var(--acc);color:var(--acc)">💭 ${nfmt(r.thinking_tokens)}</span>`);
-  else if(r.thinking_tokens===0) b.push(html`<span class="chip" title="thinking explicitly disabled">💭 off</span>`);
-  if(r.tool_count>0) b.push(html`<span class="chip" title=${(r.tool_servers||'')+' · '+(r.tools_kb||0)+'KB of tool schema'}>🔧 ${r.tool_count}${r.mcp_tools>0?html`<span class="mut"> (${r.mcp_tools} mcp)</span>`:''}</span>`);
-  if(r.cache_read>0) b.push(html`<span class="chip" title="prompt-cache read (tokens) — billed at 10%" style="border-color:var(--grn);color:var(--grn)">⚡ ${nfmt(r.cache_read)}</span>`);
-  if(r.cache_write>0) b.push(html`<span class="chip" title="prompt-cache write (tokens) — billed at 125%">✎ ${nfmt(r.cache_write)}</span>`);
-  if(r.max_tokens>0) b.push(html`<span class="chip mut" title="max_tokens">≤${nfmt(r.max_tokens)}</span>`);
-  if(r.temperature!=null) b.push(html`<span class="chip mut" title="temperature">t=${r.temperature}</span>`);
-  if(r.stop_reason&&r.stop_reason!=='end_turn'&&r.stop_reason!=='stop') b.push(html`<span class="chip" title="stop reason" style="border-color:var(--amb);color:var(--amb)">⏹ ${r.stop_reason}</span>`);
+  if(r.effort) b.push(html`<${Chip} cls="warnp" title="reasoning effort">effort ${r.effort}<//>`);
+  if(r.thinking_tokens>0) b.push(html`<${Chip} cls="crazyrouter" title="extended thinking budget (tokens)">think ${nfmt(r.thinking_tokens)}<//>`);
+  else if(r.thinking_tokens===0) b.push(html`<${Chip} title="thinking explicitly disabled">think off<//>`);
+  if(r.tool_count>0) b.push(html`<${Chip} title=${(r.tool_servers||'')+' · '+(r.tools_kb||0)+'KB of tool schema'}>tools ${r.tool_count}${r.mcp_tools>0?` (${r.mcp_tools} mcp)`:''}<//>`);
+  if(r.cache_read>0) b.push(html`<${Chip} cls="up" title="prompt-cache read (tokens) — billed at 10%">cache↓ ${nfmt(r.cache_read)}<//>`);
+  if(r.cache_write>0) b.push(html`<${Chip} title="prompt-cache write (tokens) — billed at 125%">cache↑ ${nfmt(r.cache_write)}<//>`);
+  if(r.max_tokens>0) b.push(html`<${Chip} title="max_tokens">≤${nfmt(r.max_tokens)}<//>`);
+  if(r.temperature!=null) b.push(html`<${Chip} title="temperature">t=${r.temperature}<//>`);
+  if(r.stop_reason&&r.stop_reason!=='end_turn'&&r.stop_reason!=='stop') b.push(html`<${Chip} cls="warnp" title="stop reason">${r.stop_reason}<//>`);
   if(!b.length) return '';
-  return html`<span> ${b}</span>`;
+  return html`<span class="flex" style="gap:4px;display:inline-flex;margin-left:6px">${b}</span>`;
 };
 
 /* Tri-state facet select: '' = any, '1' = yes, '0' = no. */
@@ -118,18 +140,18 @@ function buildChart(d, metric, opts){
   const maxV=Math.max(1,...totals);
   const bw=Math.max(4,Math.min(26,(plotW/pts.length)-3));
   const x=i=>padL+i*(plotW/pts.length)+(plotW/pts.length-bw)/2;
-  let g=''; for(let i=0;i<=4;i++){const yy=padT+plotH-(i/4*plotH);const vv=maxV*i/4;g+=`<line x1="${padL}" y1="${yy.toFixed(1)}" x2="${W-10}" y2="${yy.toFixed(1)}" stroke="#26262b"/><text x="${padL-6}" y="${(yy+3).toFixed(1)}" fill="#a1a1aa" font-size="10" text-anchor="end">${nfmt(vv)}</text>`;}
+  let g=''; for(let i=0;i<=4;i++){const yy=padT+plotH-(i/4*plotH);const vv=maxV*i/4;g+=`<line x1="${padL}" y1="${yy.toFixed(1)}" x2="${W-10}" y2="${yy.toFixed(1)}" stroke="${GRID}"/><text x="${padL-6}" y="${(yy+3).toFixed(1)}" fill="${AXIS}" font-size="10" text-anchor="end">${nfmt(vv)}</text>`;}
   let bars='';
   pts.forEach((p,i)=>{ let yacc=padT+plotH;
     useSeries.forEach((nm)=>{ const v=stackVal(p,nm); if(v<=0)return; const hh=v/maxV*plotH; yacc-=hh;
-      const c=metric==='err'?'#ef4444':seriesColor(nm,series.indexOf(nm));
-      bars+=`<rect x="${x(i).toFixed(1)}" y="${yacc.toFixed(1)}" width="${bw.toFixed(1)}" height="${hh.toFixed(1)}" fill="${c}" rx="1"><title>${fmtTime(p.t)}\n${nm==='__err'?'errors':nm}: ${v.toLocaleString()}</title></rect>`;
+      const c=metric==='err'?DANGER:seriesColor(nm,series.indexOf(nm));
+      bars+=`<rect x="${x(i).toFixed(1)}" y="${yacc.toFixed(1)}" width="${bw.toFixed(1)}" height="${hh.toFixed(1)}" fill="${c}" rx="2"><title>${fmtTime(p.t)}\n${nm==='__err'?'errors':nm}: ${v.toLocaleString()}</title></rect>`;
     });
   });
   let xl=''; const step=Math.max(1,Math.ceil(pts.length/6));
-  pts.forEach((p,i)=>{ if(i%step)return; const t=new Date(p.t); const lab=bm<3600000?t.toISOString().slice(11,16):t.toISOString().slice(5,16).replace('T',' '); xl+=`<text x="${(x(i)+bw/2).toFixed(1)}" y="${H-6}" fill="#a1a1aa" font-size="10" text-anchor="middle">${lab}</text>`; });
+  pts.forEach((p,i)=>{ if(i%step)return; const t=new Date(p.t); const lab=bm<3600000?t.toISOString().slice(11,16):t.toISOString().slice(5,16).replace('T',' '); xl+=`<text x="${(x(i)+bw/2).toFixed(1)}" y="${H-6}" fill="${AXIS}" font-size="10" text-anchor="middle">${lab}</text>`; });
   const svg=`<svg width="${W}" height="${H}" style="max-width:none">${g}${bars}${xl}</svg>`;
-  const legend=metric==='err'?[{name:'errors',color:'#ef4444'}]:series.map((nm,i)=>({name:nm,color:seriesColor(nm,i)}));
+  const legend=metric==='err'?[{name:'errors',color:DANGER}]:series.map((nm,i)=>({name:nm,color:seriesColor(nm,i)}));
   return {svg,hint,legend};
 }
 const Chart = ({data,metric,by,H}) => {
@@ -142,26 +164,36 @@ const Chart = ({data,metric,by,H}) => {
     <div class="mut" style="font-size:12px;margin-top:2px">${hint}</div>
   </div>`;
 };
-const Seg = ({items,val,onChange}) => html`<div class="seg">
-  ${items.map(([v,l])=>html`<button class=${v===val?'on':''} onClick=${()=>onChange(v)}>${l}</button>`)}
+/* One tab strip. It replaced `.seg`, `.wintabs`, and three hand-rolled button rows that each
+   spelled "selected" differently — one of them by turning the active tab into a primary button. */
+const Tabs = ({items,val,onChange,disabled}) => html`<div class="tabs">
+  ${items.map(([v,l])=>html`<button class=${v===val?'on':''} disabled=${disabled} onClick=${()=>onChange(v)}>${l}</button>`)}
 </div>`;
+const Seg = Tabs;   // legacy name
 
 /* ───────── app context ───────── */
 const Ctx = createContext(null);
 const useApp = () => useContext(Ctx);
 
 
-/* ───────── shared page header ───────── */
-const PageHead = ({title,onRefresh}) => html`<div class="flex" style="justify-content:space-between;margin-bottom:6px"><h2>${title}</h2>${onRefresh&&html`<button class="ghost sm" onClick=${onRefresh}>↻ Refresh</button>`}</div>`;
+/* ───────── shared page header ─────────
+   The one place a page names itself. The old sticky topbar printed the same title a second time. */
+const PageHead = ({title,desc,onRefresh,actions}) => html`<div class="pagehead">
+  <div style="min-width:0"><h2>${title}</h2>${desc&&html`<p class="desc">${desc}</p>`}</div>
+  ${(actions||onRefresh)&&html`<div class="acts">
+    ${actions}
+    ${onRefresh&&html`<button class="ghost sm" onClick=${onRefresh}>Refresh</button>`}
+  </div>`}
+</div>`;
 
 export {
   h, render, createContext, html,
   useState, useEffect, useContext, useRef, useMemo, useCallback,
   api, toast, setOnUnauth,
   clone, nfmt, usd, ago, fmtMs, fmtTime, SLOW_MS,
-  providerCls, PALETTE, PROVIDER_COLOR, seriesColor,
+  providerCls, PALETTE, PROVIDER_COLOR, seriesColor, OK, WARN, DANGER, ACCENT, ORANGE, VIOLET,
   ICON, Svg, NAV, BASE, slugFor, nameFor,
-  Pill, ProviderPill, StatusPill, KV, Card, ParamBadges, TriSel, FacetSel,
-  METRIC_LABEL, buildChart, Chart, Seg, PageHead,
+  Pill, Chip, Dot, ProviderPill, StatusPill, KV, Card, CardHead, ParamBadges, TriSel, FacetSel,
+  METRIC_LABEL, buildChart, Chart, Tabs, Seg, PageHead,
   Ctx, useApp,
 };

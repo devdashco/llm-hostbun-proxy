@@ -4,3 +4,6 @@ node_modules/
 __pycache__/
 *.pyc
 headroom-svc/.venv/
+
+# local dev: throwaway config + prices for `npm run dev`
+.local/

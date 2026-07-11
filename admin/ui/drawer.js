@@ -13,10 +13,10 @@ function CallDrawer({id,onClose}){
   <div class=${'dov'+(open?' open':'')} onClick=${onClose}></div>
   <aside class=${'drawer'+(open?' open':'')} aria-hidden=${!open}>
     <div class="drawer-hd">
-      <div style="font-weight:600">${c&&c.id?html`Call #${c.id} <${StatusPill} status=${c.status} error=${c.error}/> <${ProviderPill} provider=${c.provider}/>`:'Call'}</div>
+      <div class="flex" style="font-weight:600;gap:8px">${c&&c.id?html`<span>Call #${c.id}</span><${StatusPill} status=${c.status} error=${c.error}/><${ProviderPill} provider=${c.provider}/>`:'Call'}</div>
       <span style="flex:1"></span>
       <button class="ghost sm" onClick=${copy}>Copy JSON</button>
-      <button class="ghost sm" onClick=${onClose}>✕</button>
+      <button class="quiet sm" onClick=${onClose} aria-label="close">✕</button>
     </div>
     <div class="drawer-bd">
       ${c==null||c==='loading'?html`<span class="mut">${c==='loading'?'loading…':''}</span>`
@@ -30,13 +30,13 @@ function CallDrawer({id,onClose}){
         <${KV} n="latency">${fmtMs(c.duration_ms)}<//>
         <${KV} n="stream">${c.stream?'yes':'no'}<//>
         <${KV} n="tokens">${c.prompt_tokens??'?'} → ${c.completion_tokens??'?'} <span class="mut">(${c.total_tokens??'?'})</span><//>
-        <${KV} n="effort">${c.effort?html`<span style="color:var(--amb)">🧠 ${c.effort}</span>`:'—'}<//>
-        <${KV} n="thinking">${c.thinking_tokens==null?'—':c.thinking_tokens===0?'off':html`<span style="color:var(--acc)">💭 ${nfmt(c.thinking_tokens)} tok</span>`}<//>
+        <${KV} n="effort">${c.effort?html`<span style="color:var(--warn)">${c.effort}</span>`:'—'}<//>
+        <${KV} n="thinking">${c.thinking_tokens==null?'—':c.thinking_tokens===0?'off':html`<span style="color:var(--accent)">${nfmt(c.thinking_tokens)} tok</span>`}<//>
         <${KV} n="max tokens">${c.max_tokens?nfmt(c.max_tokens):'—'}<//>
         <${KV} n="temperature">${c.temperature==null?'—':c.temperature}<//>
         <${KV} n="ip">${c.ip||'—'}<//>
       </div></div>
-      ${c.error&&html`<div class="dsec"><div class="dlbl" style="color:var(--red)">error</div><div class="msgbox" style="color:var(--red)">${c.error}</div></div>`}
+      ${c.error&&html`<div class="dsec"><div class="dlbl" style="color:var(--danger)">error</div><div class="msgbox" style="color:var(--danger);border-color:oklch(0.645 0.205 25 / .35)">${c.error}</div></div>`}
       <div class="dsec"><div class="dlbl">prompt</div><div class="msgbox">${c.req_content||'(not stored)'}</div></div>
       <div class="dsec"><div class="dlbl">reply</div><div class="msgbox">${c.resp_content||'(not stored)'}</div></div>
       ${c.ua&&html`<div class="dsec"><div class="dlbl">client · user-agent</div><div class="msgbox" style="max-height:none">${c.ua}</div></div>`}

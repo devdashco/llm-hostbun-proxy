@@ -1,4 +1,4 @@
-import { html, useState, useEffect, useCallback, api, toast, KV, Card, PageHead, useApp } from "../core.js";
+import { html, useState, useEffect, useCallback, api, toast, KV, Card, CardHead, PageHead, useApp } from "../core.js";
 
 /* ───────── CRAZYROUTER ───────── */
 function Crazyrouter(){
@@ -10,9 +10,8 @@ function Crazyrouter(){
     try{ const r=await api('crazyrouter/test',{method:'POST',body:JSON.stringify({key})}); setTest(JSON.stringify(r,null,2)); toast(r.keyValid?'key is VALID — click Save key':'key is INVALID',!r.keyValid); }catch(e){ setTest('error: '+e.message); } }
   async function saveKey(){ const key=nk.trim(); if(!key){toast('paste a key',true);return;} try{ const r=await api('config',{method:'POST',body:JSON.stringify({crazyrouterKey:key})}); reload(r.state); setNk(''); toast('key saved (live)'); load(); }catch(e){toast(e.message,true);} }
   return html`
-  <${PageHead} title="Crazyrouter (cloud provider)" onRefresh=${load}/>
-  <${Card}>
-    ${c==='loading'||c==null?html`<div class="mut">${c==null?'unavailable':'checking…'}</div>`:html`
+  <${PageHead} title="Crazyrouter" desc="The cloud relay, and the only provider that bills per token." onRefresh=${load}/>
+  ${c==='loading'||c==null?html`<div class="alert">${c==null?'Crazyrouter is unreachable.':'Checking…'}</div>`:html`
     <div class="grid">
       <${KV} n="Key">${c.keySet?(c.keyValid?html`<span class="up">valid</span>`:html`<span class="down">INVALID</span>`):html`<span class="down">not set</span>`}<//>
       <${KV} n="Limit">${c.hardLimitUsd!=null?'$'+c.hardLimitUsd:'—'}<//>
@@ -21,12 +20,11 @@ function Crazyrouter(){
       <${KV} n="Models">${c.modelCount??'—'}<//>
       <${KV} n="Key id">${c.keyMasked||'(none)'}<//>
     </div>
-    ${(c.message||!c.keyValid)&&html`<p class="warn" style="margin-top:12px">${(c.message||'key check failed')+(c.statuses?' · statuses '+JSON.stringify(c.statuses):'')}</p>`}`}
-  </${Card}>
+    ${(c.message||!c.keyValid)&&html`<div class="alert warn">${(c.message||'key check failed')+(c.statuses?' · statuses '+JSON.stringify(c.statuses):'')}</div>`}`}
   <${Card}>
-    <h3>Update key <small class="hint">— paste a new <code>sk-</code> key; test it before saving</small></h3>
+    <${CardHead} title="Update key" hint=${html`Paste a new <code>sk-</code> key and test it before saving. Saving takes effect immediately, with no redeploy.`}/>
     <input placeholder="sk-…" value=${nk} onInput=${e=>setNk(e.target.value)}/>
-    <div class="flex" style="margin-top:10px"><button class="ghost" onClick=${testKey}>Test key</button><button onClick=${saveKey}>Save key (live, no redeploy)</button></div>
+    <div class="flex" style="margin-top:12px"><button class="ghost" onClick=${testKey}>Test key</button><button onClick=${saveKey}>Save key</button></div>
     ${test!=null&&html`<pre>${test}</pre>`}
   </${Card}>`;
 }

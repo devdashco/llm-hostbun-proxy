@@ -2,11 +2,38 @@
   "controls": [
     {
       "id": "links",
-      "title": "\ud83d\udd17 Links (4)",
+      "title": "\ud83d\udd17 Links (8)",
       "command": "cmuxdock"
+    },
+    {
+      "id": "router",
+      "title": "\ud83d\udda5 Router :8787",
+      "cwd": ".",
+      "height": 260,
+      "command": "until npm run dev; do echo '[dock] router exited \u2014 restarting in 2s (Ctrl-C to stop)'; sleep 2; done"
     }
   ],
   "links": [
+    {
+      "group": "Local \u2014 npm run dev",
+      "name": "Panel",
+      "url": "http://localhost:8787/"
+    },
+    {
+      "group": "Local \u2014 npm run dev",
+      "name": "Docs",
+      "url": "http://localhost:8787/docs/"
+    },
+    {
+      "group": "Live",
+      "name": "Panel",
+      "url": "https://llm.hostbun.cc/"
+    },
+    {
+      "group": "Live",
+      "name": "Docs",
+      "url": "https://docs.llm.hostbun.cc/"
+    },
     {
       "group": "This repo \u2014 devdashco/llm-hostbun-router",
       "name": "Repo",
