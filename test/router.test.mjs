@@ -134,18 +134,14 @@ check("/admin/api/* is gone", status("/admin/api/state"), "404");
 // specified; no default route") — a 400. There is no catch-all at the root, by design.
 check("an unknown path is refused, not routed", status("/nope"), "400");
 
-// The pool view is the one screen that answers "can we serve anything at all". Its verdict is
-// computed server-side so Overview and Accounts cannot disagree — assert the contract, not the CSS.
+// The pool view lists every subscription, its usage-window headroom, and who spends it. These are
+// Claude Max logins — there is no per-model "serves" verdict (a 429 is a usage window, not a
+// capability). Assert the contract: a row per account, and orphan pins are surfaced.
 console.log("accounts — the pool view:");
 {
   const a = api("accounts");
-  const byName = Object.fromEntries(a.accounts.map((x) => [x.name, x]));
   check("every pool account gets a row, traffic or not", a.accounts.map((x) => x.name).sort(), ["acctA", "acctB"]);
-  // Never probed, no harvested headroom → "unknown". NOT "ok": an exhausted account reads 0% ·
-  // allowed until someone probes it, so an unprobed account must never render as healthy.
-  check("an unprobed account is unknown, not ok", byName.acctA.health, "unknown");
-  check("summary counts the unprobed", [a.summary.accounts, a.summary.unprobed, a.summary.serving, a.summary.dry], [2, 2, 0, 0]);
-  check("no probe means no model is known to answer", a.summary.servingModels, 0);
+  check("summary counts the pool", a.summary.accounts, 2);
   api("pins", { project: "ghostproj", account: "acctA" });
   api("config", { projectAccounts: { ghostproj: "vanished" } });   // simulate an account removed from the pool
   const b = api("accounts");

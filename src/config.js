@@ -22,12 +22,13 @@ const CLAUDECODE_MODEL_SEED = Object.freeze([
 //
 // Verified one id at a time against api.anthropic.com (2026-07-09), NOT derived by stripping the
 // date: `claude-opus-4-1` 404s while `claude-opus-4-1-20250805` serves, and `claude-opus-4-8-20260528`
-// 404s while the undated `claude-opus-4-8` serves. The mapping is not mechanical. Re-verify with
-// POST /api/claudecode/probe before adding one — a 404 here advertises a model that does not exist.
+// 404s while the undated `claude-opus-4-8` serves. The mapping is not mechanical — verify a new id
+// with a single native `/v1/messages` call before adding one (a 404 advertises a model that does
+// not exist; a 429 means it exists and the subscription's usage window is spent).
 const CLAUDECODE_MODEL_ALIASES = Object.freeze([
-  "claude-haiku-4-5",    // 200 on a live account
-  "claude-sonnet-4-5",   // 429 = exists, quota-dry
-  "claude-opus-4-5",     // 429 = exists, quota-dry
+  "claude-haiku-4-5",
+  "claude-sonnet-4-5",
+  "claude-opus-4-5",
 ]);
 const CLAUDECODE_MODEL_REFRESH_MS = 6 * 3600 * 1000;
 // Client-side routes of the control panel (its NAV slugs). Kept in sync with admin/index.html by

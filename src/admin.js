@@ -20,36 +20,13 @@ const C = require("./config");
 const { CFG, setCFG, persistConfig, mergeConfig, envDefaults, loadConfig, reindexKeys, CANON, OBLIT, E4B,
         PROVIDERS, normProvider, sanitizeRule, sanitizeLimit, IMAGE_MODEL_IDS, CONFIG_FILE } = C;
 const DB = require("./db");
-const { dbUp, dbRow, dbRows, ACCT_CACHE, ORG_OF_ACCOUNT, PROBE_CACHE, FACET_CACHE } = DB;
+const { dbUp, dbRow, dbRows, ACCT_CACHE, ORG_OF_ACCOUNT, FACET_CACHE } = DB;
 const { priceMap, costUsd } = require("./pricing");
 const { mintKey, sha256, parseConsumer } = require("./identity");
 const { resolveRoute, accountFor, acctHealth, isGated, localTarget, limitFor, projectUsage } = require("./routing");
 const { readBody, sendJson, mask, buildHeaders } = require("./http");
 const CC = require("./claudecode");
-const { probeAccount, refreshClaudecodeModels, upstreamCatalogs, localModelEntries } = CC;
-
-// A probe older than this is history, not status — a 5h window can empty and refill inside it.
-const PROBE_STALE_MS = 6 * 3600 * 1000;
-
-// The single verdict for one pool account, so the Overview banner and the Accounts table can never
-// disagree. Precedence is deliberate:
-//   dry     — probed, and not one advertised model answered. The account is unusable NOW.
-//   hot     — ≥90% of a window burned, or Anthropic itself says warning. Usable, about to not be.
-//   thin    — serves something, but ≥1 model that EXISTS on this org answered 429. In practice this
-//             is the whole pool: haiku answers, opus and sonnet are exhausted. Rendering that as
-//             "ok" is how a project pinned here 429s on opus while the panel says everything is fine.
-//             A 404 does not count — that id was never ours to call.
-//   unknown — never probed. NOT "ok": the 5h/7d bars are harvested off headers a 429 never sends,
-//             so an exhausted account sits at a cheerful `0% · allowed` until someone probes it.
-//   ok      — probed, every advertised model that exists on this org answers.
-function poolHealth(a) {
-  if (a.probe && !a.probe.usable.length) return "dry";
-  const l = a.limits;
-  if (l && (l.s5 === "allowed_warning" || l.s7 === "allowed_warning" || (l.u5 || 0) >= 0.9 || (l.u7 || 0) >= 0.9)) return "hot";
-  if (!a.probe) return "unknown";
-  if (a.probe.exhausted > 0) return "thin";
-  return "ok";
-}
+const { refreshClaudecodeModels, upstreamCatalogs, localModelEntries } = CC;
 
 // ─────────────────────────────────────────────────────────────────────────────
 const COOKIE = "hb_admin";
@@ -309,28 +286,6 @@ async function handleAdminApi(req, res, path, prefix = "/api/") {
     });
   }
 
-  // Which advertised models does an account ACTUALLY serve? The catalog lists every model the org
-  // can see; the subscription decides which ones answer. Those disagree — an exhausted Max plan
-  // lists Opus and 429s it. Worse, a 429 carries no anthropic-ratelimit-* headers, so the headroom
-  // harvest learns nothing from exactly the calls that matter and Accounts renders a cheerful 0%.
-  // One max_tokens:1 ping per model is the only honest answer. ~9 pings, a few tokens each.
-  if (sub === "claudecode/probe" && req.method === "POST") {
-    const body = await readBody(req);
-    let p = {};
-    try { p = JSON.parse(body.toString()); } catch {}
-    const pool = CFG.claudecodeAccountPool || [];
-    // `all` probes the whole pool. That is |accounts| × |models| pings, so it stays an explicit,
-    // operator-initiated action — never a background refresh.
-    if (p.all) {
-      const out = [];
-      for (const a of pool) out.push(await probeAccount(a));   // serial: don't hammer one org's limiter
-      return sendJson(res, 200, { accounts: out, checkedAt: Date.now() });
-    }
-    const acct = p.account ? pool.find((a) => a.name.toLowerCase() === String(p.account).trim().toLowerCase()) : pool[0];
-    if (!acct) return sendJson(res, 400, { error: "no such account", accounts: pool.map((a) => a.name) });
-    return sendJson(res, 200, await probeAccount(acct));
-  }
-
   // Everything the operator needs to answer "can this account serve anything, and who is spending
   // it". The pool is the spine — an account with no traffic and no probe still gets a row, which is
   // exactly the case the old org-keyed limits table could not represent.
@@ -361,7 +316,6 @@ async function handleAdminApi(req, res, path, prefix = "/api/") {
       const org = ORG_OF_ACCOUNT.get(a.name) || null;
       const l = org ? lim.get(org) : null;
       const s = spend.get(a.name) || {}, s24 = spend24.get(a.name) || {};
-      const pr = PROBE_CACHE.get(a.name) || null;
       return {
         name: a.name, org,
         projects: Object.keys(pins).filter((p) => pins[p] === a.name).sort(),
@@ -370,38 +324,15 @@ async function handleAdminApi(req, res, path, prefix = "/api/") {
         usage: { calls: s.calls || 0, tokens: Number(s.tokens) || 0, lastTs: Number(s.last_ts) || 0,
           rateLimited: s.rate_limited || 0, errors: s.errors || 0,
           calls24h: s24.calls || 0, tokens24h: Number(s24.tokens) || 0 },
-        // 404 = the id does not exist on this org. 429 = it exists and the subscription is dry.
-        // That distinction is the entire point of probing, so it ships as counts, not a ratio.
-        probe: pr ? { checkedAt: pr.checkedAt, usable: pr.usable, total: pr.results.length,
-          dead: pr.results.filter((r) => r.status === 404).length,
-          exhausted: pr.results.filter((r) => r.status === 429).length } : null,
       };
     });
-    // One verdict per account, computed HERE so Overview and Accounts can never disagree about which
-    // account is dry. A probe that found nothing outranks a cheerful 0% bar: the bar is a floor
-    // harvested off headers that a 429 never sends.
-    for (const a of accounts) a.health = poolHealth(a);
-    const rank = { dry: 0, hot: 1, thin: 2, unknown: 3, ok: 4 };
-    accounts.sort((x, y) => (rank[x.health] - rank[y.health]) || x.name.localeCompare(y.name));
+    accounts.sort((x, y) => x.name.localeCompare(y.name));
     return sendJson(res, 200, {
       accounts, now: Date.now(), defaultAccount: CFG.defaultAccount || "",
       advertisedModels: (CFG.claudecodeModels || []).length,
       // A pinned project naming an account that no longer exists in the pool 403s at request time.
       orphanPins: Object.entries(pins).filter(([, acc]) => !pool.some((a) => a.name === acc)).map(([p, acc]) => ({ project: p, account: acc })),
-      summary: {
-        accounts: accounts.length,
-        dry: accounts.filter((a) => a.health === "dry").length,
-        hot: accounts.filter((a) => a.health === "hot").length,
-        thin: accounts.filter((a) => a.health === "thin").length,
-        // Models that answer on at least one account. If this is 1 while 13 are advertised, the pool
-        // serves haiku and nothing else, however green the individual rows look.
-        servingModels: [...new Set(accounts.flatMap((a) => (a.probe ? a.probe.usable : [])))].length,
-        unprobed: accounts.filter((a) => !a.probe).length,
-        serving: accounts.filter((a) => a.probe && a.probe.usable.length).length,
-        // A dry account with projects pinned to it is an outage those projects have not hit yet.
-        strandedProjects: accounts.filter((a) => a.health === "dry").flatMap((a) => a.projects),
-        staleProbes: accounts.filter((a) => a.probe && Date.now() - a.probe.checkedAt > PROBE_STALE_MS).length,
-      },
+      summary: { accounts: accounts.length },
     });
   }
 
@@ -485,8 +416,6 @@ async function handleAdminApi(req, res, path, prefix = "/api/") {
     CFG.claudecodeAccountPool = pool;
     CFG.anthropicPool = pool;   // legacy name, kept in sync so a rollback still boots
     const persisted = persistConfig();
-    // A rotated token means a new session with the org; the cached catalog for it is now suspect.
-    PROBE_CACHE.delete(pool[i].name);
     console.warn(`[admin] token rotated for account=${pool[i].name} ip=${ip} persisted=${persisted}`);
     return sendJson(res, 200, { ok: true, persisted, account: pool[i].name });
   }

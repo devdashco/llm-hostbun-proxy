@@ -1,13 +1,10 @@
-// The claudecode provider's model catalog, and the only honest way to ask an account what it will
-// actually serve.
-//
-// A 429 from Anthropic carries no anthropic-ratelimit-* headers, so the harvested acct_limits row
-// keeps reporting its last good reading while the account is bone dry. /api/limits is a floor,
-// not a verdict. probeAccount() pings every advertised id: 404 = the model does not exist, 429 = it
-// exists and the subscription is exhausted.
+// The claudecode provider's model catalog: the ids the router will route to Anthropic. These are
+// subscription (Claude Max) logins, so the pool serves whatever Claude Code serves — the router does
+// not second-guess per-account model availability (a 429 is a subscription usage window, not a
+// capability, and treating it as one only misled the panel).
 const TR = require("../translate");
 const { CFG, persistConfig, IMAGE_MODEL_IDS, CLAUDECODE_MODEL_SEED, CLAUDECODE_MODEL_ALIASES, CLAUDECODE_MODEL_REFRESH_MS } = require("./config");
-const { ORG_OF_ACCOUNT, PROBE_CACHE, persistProbe } = require("./db");
+const { ORG_OF_ACCOUNT } = require("./db");
 const { localTarget } = require("./routing");
 
 function localModelEntries() {
@@ -52,8 +49,7 @@ async function upstreamCatalogs() {
 //   paginated:   /v1/models answers `has_more` + `last_id`. One page is not the list.
 //
 // So: sweep EVERY account, follow EVERY page, union the lot. Each model records which accounts
-// offer it (`accounts`), because "advertised" and "servable by your pinned account" are different
-// questions — /v1/models answers the first, claudecode/probe answers the second.
+// offer it (`accounts`), so an id only one org can see is still surfaced.
 //
 // A failed sweep is a no-op, never a downgrade: CFG keeps whatever it already had. A partial sweep
 // (some accounts erroring) still unions what it did get, floored by CLAUDECODE_MODEL_SEED.
@@ -132,37 +128,8 @@ async function mergedModels(res) {
   res.end(JSON.stringify({ object: "list", data: [...local, ...images, ...claudecode, ...crazyrouter] }));
 }
 
-// Build a concrete route for an explicit (provider, model) — used by forceModel / modelRoutes /
-
-async function probeAccount(acct) {
-  const ids = CFG.claudecodeModels || [];
-  const results = await Promise.all(ids.map(async (id) => {
-    const t0 = Date.now();
-    try {
-      const r = await fetch(`${CFG.bases.claudecode}/v1/messages`, {
-        method: "POST", headers: TR.anthropicHeaders(acct.token), signal: AbortSignal.timeout(20000),
-        body: JSON.stringify({ model: id, max_tokens: 1, messages: [{ role: "user", content: "hi" }] }),
-      });
-      // Anthropic stamps the org-id on every reply, 4xx included. An account with no traffic and no
-      // catalog sweep otherwise has no org-id, so its acct_limits row can never be joined and the
-      // panel shows "org unknown" forever. A probe is a reply — take it.
-      const org = r.headers.get("anthropic-organization-id");
-      if (org) ORG_OF_ACCOUNT.set(acct.name, org);
-      let errType = null;
-      if (!r.ok) { try { errType = ((await r.json()).error || {}).type || null; } catch {} }
-      return { id, status: r.status, ok: r.ok, error: errType, ms: Date.now() - t0 };
-    } catch (e) { return { id, status: 0, ok: false, error: e.message, ms: Date.now() - t0 }; }
-  }));
-  const usable = results.filter((r) => r.ok).map((r) => r.id);
-  console.log(`[models] probe ${acct.name}: ${usable.length}/${ids.length} usable (${usable.join(",") || "none"})`);
-  const out = { account: acct.name, checkedAt: Date.now(), usable, results };
-  PROBE_CACHE.set(acct.name, out);
-  persistProbe(out);   // survives the next deploy; the Map does not
-  return out;
-}
-
 module.exports = {
   localModelEntries, upstreamCatalogs, mergedModels, fetchAccountModels, fetchAnthropicModels,
-  refreshClaudecodeModels, probeAccount, claudecodeCatalog: () => claudecodeCatalog,
+  refreshClaudecodeModels, claudecodeCatalog: () => claudecodeCatalog,
   CLAUDECODE_MODEL_REFRESH_MS,
 };

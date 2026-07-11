@@ -31,7 +31,7 @@
 //   src/routing.js     where it goes: pins, allowlists, groups, usage limits, account pinning
 //   src/http.js        the wire: readBody, buildHeaders, proxy(), JSON enforcement
 //   src/db.js          the call log (Postgres) and harvested account headroom
-//   src/claudecode.js  the Anthropic catalog and per-account probes
+//   src/claudecode.js  the Anthropic model catalog
 //   src/admin.js       the control-plane API (/api/*) behind the password cookie
 //   src/telemetry.js   call-log row shaping + HyperDX error shipping
 //   src/pricing.js     USD estimates (crazyrouter only; the rest are flat or free)
