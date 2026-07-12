@@ -1,10 +1,11 @@
-import { html, render, h, useState, useEffect, useCallback, api, toast, nfmt, ago,
-         Chip, Card, CardHead, KV, PageHead, useApp } from "../core.js";
+import { html, useState, useEffect, useCallback, api, toast, nfmt, ago,
+         Chip, Card, CardHead, PageHead, useApp } from "../core.js";
 
 /* ───────── Accounts: live per-account 5h/7d limits, harvested free off real traffic ───────── */
-/* Project pins. One project → one account, forever; no header can override it. Rotating accounts
-   blows the per-org prompt cache and makes "who spent this?" unanswerable. An unpinned project
-   403s rather than billing a guess, so this table is the ONLY way a new app gets served. */
+/* Account mapping (projectAccounts). THE place a project is bound to a subscription: one project →
+   one account, forever; no header can override it. Rotating accounts blows the per-org prompt cache
+   and makes "who spent this?" unanswerable. An unpinned project 403s rather than billing a guess, so
+   this table is the ONLY way a new app gets served on claudecode. */
 function Pins(){
   const {state,reload}=useApp();
   const pins=state.projectAccounts||state.consumerAccounts||{};
@@ -22,22 +23,22 @@ function Pins(){
   const names=Object.keys(pins).sort();
   return html`
   <${Card}>
-    <${CardHead} title="Project pins" hint="Which subscription each app spends."/>
-    <p class="hint" style="margin:0 0 14px">An <b>unpinned</b> project gets <code>403 no_account_for_project</code>. That is deliberate: the gateway never guesses whose Max plan to bill. ${state.defaultAccount?html`<b class="down">defaultAccount is set to "${state.defaultAccount}", so every unpinned or misspelled project silently bills it instead of 403'ing.</b>`:html`<code>defaultAccount</code> is empty, which is what keeps the 403 honest.`}</p>
+    <${CardHead} title="Account mapping" hint="Which Max subscription each project is billed to — set it here."/>
+    <p class="hint" style="margin:0 0 14px"><b>This is where a project is bound to an account.</b> One project → one account (no request header can change it); a project that is not mapped gets <code>403 no_account_for_project</code> — the gateway never guesses whose Max plan to bill. Each account's mapped projects also show in the <b>Pool</b> table below. ${state.defaultAccount?html`<b class="down">defaultAccount is set to "${state.defaultAccount}", so every unmapped or misspelled project silently bills it instead of 403'ing.</b>`:html`<code>defaultAccount</code> is empty, which is what keeps the 403 honest.`}</p>
     <div class="tablewrap"><table>
-      <tr><th>project</th><th>account</th><th></th></tr>
+      <tr><th>project</th><th>→ account</th><th></th></tr>
       ${names.length?names.map(p=>html`<tr key=${p}>
         <td class="mono" style="font-weight:600">${p}</td>
         <td style="max-width:220px"><select disabled=${busy===p} value=${pins[p]} onChange=${e=>setPin(p,e.target.value)}>
           ${accounts.map(a=>html`<option value=${a} selected=${a===pins[p]}>${a}</option>`)}
         </select></td>
         <td style="width:1%"><button class="quiet sm" disabled=${busy===p} onClick=${()=>setPin(p,null)}>Unpin</button></td>
-      </tr>`):html`<tr><td colspan="3" class="hint">No pins — every claudecode call is 403'ing.</td></tr>`}
+      </tr>`):html`<tr><td colspan="3" class="hint">Nothing is mapped — every claudecode call is 403'ing.</td></tr>`}
     </table></div>
     <div class="row" style="margin-top:14px">
-      <input style="flex:2;min-width:180px" placeholder="new project slug, e.g. promopilot" value=${np} onInput=${e=>setNp(e.target.value)} onKeyDown=${e=>e.key==='Enter'&&add()}/>
+      <input style="flex:2;min-width:180px" placeholder="map a project, e.g. promopilot" value=${np} onInput=${e=>setNp(e.target.value)} onKeyDown=${e=>e.key==='Enter'&&add()}/>
       <select style="flex:1;min-width:140px" value=${na} onChange=${e=>setNa(e.target.value)}>${accounts.map(a=>html`<option value=${a}>${a}</option>`)}</select>
-      <button style="flex:0 0 auto" disabled=${!!busy} onClick=${add}>Pin</button>
+      <button style="flex:0 0 auto" disabled=${!!busy} onClick=${add}>Map</button>
     </div>
   </${Card}>`;
 }
@@ -96,7 +97,6 @@ function Accounts(){
       load();
     }catch(e){ toast(e.message,true); } finally{ setBusy(''); }
   }
-  const rel=ts=>{ if(!ts)return '—'; const ms=ts*1000-now; if(ms<=0)return 'now'; const h=ms/3600000; return h<48?(h>=1?Math.round(h)+'h':Math.max(1,Math.round(ms/60000))+'m'):(h/24).toFixed(1)+'d'; };
   const since=ts=>ts?ago(ts,now)+' ago':'never';
   // The actual reset clock: within a day → "Wed 14:30", further out → "Jul 16 09:00". Full locale
   // timestamp on hover. A window resets to 0% at this moment, so it is the real "when can I use it".
@@ -118,7 +118,7 @@ function Accounts(){
     if(st==='rejected'||st==='blocked') return {t:st,c:'var(--danger)'}; return {t:st,c:'var(--fg-sub)'}; };
   // One usage window (5h or 7d): utilisation bar + %, its status, the reset clock/date, and a live
   // countdown that ticks down to the reset. Full date on hover so "Sat" is never ambiguous.
-  const windowCell=(u,resetSec,st)=>{ const sl=statusLabel(st); const pct=u==null?null:Math.round(u*100);
+  const windowCell=(u,resetSec,st)=>{ const sl=statusLabel(st);
     return html`
       <div class="flex" style="align-items:baseline;gap:6px">
         <div style="flex:1;min-width:52px"><${Bar} v=${u}/></div>
@@ -136,17 +136,12 @@ function Accounts(){
     <div class="mut" style="margin-top:5px">Those projects <code>403</code> on every call: ${d.orphanPins.map(o=>html`<code>${o.project} → ${o.account}</code> `)}</div>
   </div>`:''}
 
-  <div class="grid">
-    <${KV} n="Pool">${s.accounts??'…'} account${s.accounts===1?'':'s'}<//>
-    <${KV} n="Model catalog">${d?`${d.advertisedModels} ids`:'…'}<//>
-  </div>
-
   <${Pins}/>
 
   <${Card}>
-    <${CardHead} title="Pool" hint="Every subscription, its usage-window headroom, and who spends it."
+    <${CardHead} title="Pool" hint=${d?`${s.accounts} subscription${s.accounts===1?'':'s'} · ${d.advertisedModels} model ids · usage windows + who spends each`:'the Claude Max subscriptions'}
       actions=${html`<button class="ghost sm" disabled=${!!busy} onClick=${()=>refreshLimits(null)} title="ping each subscription once and read its live 5h/7d usage window">${busy==='all'?'Refreshing…':'↻ Refresh limits (live)'}</button>`}/>
-    <p class="hint" style="margin:0 0 6px">The <b>5h</b>/<b>7d</b> bars are the Claude Max usage windows. Without a refresh they are <b class="warnp">harvested off real traffic and read as a floor</b> — an idle account (or one Anthropic just refunded) keeps its last reading until it serves a call. Hit <b>Refresh limits (live)</b> to ping each subscription once and pull the real window right now; a <span style="color:var(--ok)">● live</span> tag marks a row that has a fresh reading.</p>
+    <p class="hint" style="margin:0 0 6px">The <b>5h</b>/<b>7d</b> bars are the Claude Max usage windows, <b class="warnp">harvested off real traffic — a floor, not live</b>: an idle account (or one Anthropic just refunded) keeps its last reading until it serves a call. Hit <b>↻ Refresh limits (live)</b> to read the real windows now; a <span style="color:var(--ok)">● live</span> tag marks a fresh row.</p>
     ${err?html`<p class="down">${err}</p>`:''}
     ${!d?html`<p class="hint">loading…</p>`:''}
     <div class="tablewrap" style="margin-top:12px"><table>
