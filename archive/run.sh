@@ -36,11 +36,16 @@ if [ -z "${S3_ACCESS_KEY:-}" ] || [ -z "${S3_SECRET_KEY:-}" ]; then
   exit 2
 fi
 
-# ── beacon: start ────────────────────────────────────────────────────────────
-beacon() { [ -n "${BEACON_URL:-}" ] || return 0; curl -fsS -m 10 -X POST "$BEACON_URL/v1/event" \
-  -H 'content-type: application/json' -d "{\"slug\":\"$SLUG\",\"event\":\"$1\",\"message\":$(node -e 'process.stdout.write(JSON.stringify(process.argv[1]||""))' "${2:-}")}" >/dev/null 2>&1 || true; }
+# ── beacon: report run status ────────────────────────────────────────────────
+# The beacon (scriptbox-mcp) heartbeats via an upsert to /v1/register with x-api-key: a status field
+# plus a message. Best-effort — a beacon hiccup must never fail the archive. $1=status, $2=message.
+beacon() {
+  [ -n "${BEACON_URL:-}" ] && [ -n "${BEACON_KEY:-}" ] || return 0
+  local body; body="$(node -e 'const[s,st,m]=process.argv.slice(1);process.stdout.write(JSON.stringify({slug:s,last_status:st,last_run:new Date().toISOString(),message:m||""}))' "$SLUG" "$1" "${2:-}")"
+  curl -fsS -m 10 -X POST "$BEACON_URL/v1/register" -H "x-api-key: $BEACON_KEY" -H 'content-type: application/json' -d "$body" >/dev/null 2>&1 || true
+}
 
-beacon start ""
+beacon running "incremental archive started"
 echo "$(date -u +%FT%TZ) === run start ===" >>"$LOG"
 
 # ── run ──────────────────────────────────────────────────────────────────────
@@ -53,5 +58,5 @@ echo "$(date -u +%FT%TZ) rc=$RC summary=$SUMMARY" >>"$LOG"
 # rotate: keep the log bounded (last ~5000 lines)
 if [ "$(wc -l <"$LOG" 2>/dev/null || echo 0)" -gt 6000 ]; then tail -5000 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"; fi
 
-if [ "$RC" -eq 0 ]; then beacon finish "$SUMMARY"; else beacon fail "rc=$RC"; fi
+if [ "$RC" -eq 0 ]; then beacon completed "${SUMMARY:-ok}"; else beacon failed "rc=$RC"; fi
 exit "$RC"
