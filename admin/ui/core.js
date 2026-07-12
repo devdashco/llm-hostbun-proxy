@@ -89,6 +89,15 @@ const StatusPill = ({status,error}) => {
   if(status>=400) return html`<${Pill} cls="down">${status}<//>`;
   return html`<${Pill} cls="up">${status||'—'}<//>`;
 };
+/* Identity is a path, `<consumer>[:<job>]`. One chip renders it everywhere: consumer carries the
+   weight, the job rides muted after it — so `promopilot:generatetext` reads as promopilot's job,
+   not as a different caller. Split on the FIRST colon only, same as the router. */
+const ProjectChip = ({p}) => {
+  if(!p) return html`<span class="mut" style="font-size:11px">(none)</span>`;
+  const i=String(p).indexOf(':');
+  if(i<0) return html`<${Chip} cls="tag">${p}<//>`;
+  return html`<${Chip} cls="tag">${p.slice(0,i)}<span style="opacity:.55;font-weight:400">:${p.slice(i+1)}</span><//>`;
+};
 const KV = ({n,children}) => html`<div class="kv"><div class="n">${n}</div><div class="v">${children}</div></div>`;
 const Card = ({cls,children}) => html`<div class="card ${cls||''}">${children}</div>`;
 /* Section header: title, one line of why-it-matters, and the actions that belong to it. */
@@ -203,7 +212,7 @@ export {
   clone, nfmt, usd, ago, fmtMs, fmtTime, SLOW_MS,
   providerCls, PALETTE, PROVIDER_COLOR, seriesColor, OK, WARN, DANGER, ACCENT, ORANGE, VIOLET,
   ICON, Svg, NAV, SLUG_ALIAS, BASE, slugFor, nameFor,
-  Pill, Chip, Dot, ProviderPill, StatusPill, KV, Card, CardHead, ParamBadges, TriSel, FacetSel,
+  Pill, Chip, Dot, ProviderPill, StatusPill, ProjectChip, KV, Card, CardHead, ParamBadges, TriSel, FacetSel,
   METRIC_LABEL, buildChart, Chart, Tabs, Seg, useTab, PageHead,
   Ctx, useApp,
 };

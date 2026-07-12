@@ -1,5 +1,5 @@
 import { html, h, useState, useEffect, useCallback, api, ago, nfmt, fmtMs, fmtTime, SLOW_MS,
-         Pill, Chip, Dot, ProviderPill, StatusPill, KV, Card, CardHead, Chart, Tabs, PageHead, useApp,
+         Pill, Chip, Dot, ProviderPill, StatusPill, ProjectChip, KV, Card, CardHead, Chart, Tabs, PageHead, useApp,
          WARN, DANGER } from "../core.js";
 import { Bar } from "./accounts.js";
 
@@ -59,7 +59,7 @@ function Overview(){
       ${(recent||[]).length? (recent||[]).map(r=>html`
         <tr class="click" onClick=${()=>openCall(r.id)}>
           <td class="mono mut" style="font-size:12px;white-space:nowrap" title=${fmtTime(r.ts)}>${ago(r.ts)} ago</td>
-          <td>${r.project?html`<${Chip} cls="tag">${r.project}<//>`:html`<span class="mut" style="font-size:11px">(none)</span>`}</td>
+          <td><${ProjectChip} p=${r.project}/></td>
           <td class="mono" style="font-size:12px">${r.req_model||'-'}</td>
           <td><${ProviderPill} provider=${r.provider}/></td>
           <td><${StatusPill} status=${r.status} error=${r.error}/></td>

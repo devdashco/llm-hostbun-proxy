@@ -1,4 +1,4 @@
-import { html, useState, useEffect, useRef, useCallback, api, toast, clone, nfmt, fmtTime, Chip, ProviderPill, StatusPill, Card, CardHead, ParamBadges, TriSel, FacetSel, PageHead, useApp } from "../core.js";
+import { html, useState, useEffect, useRef, useCallback, api, toast, clone, nfmt, fmtTime, Chip, ProviderPill, StatusPill, ProjectChip, Card, CardHead, ParamBadges, TriSel, FacetSel, PageHead, useApp } from "../core.js";
 
 /* ───────── CALLS ───────── */
 const CALL_WINDOWS=[['','any time'],['15m','last 15 min'],['1h','last hour'],['6h','last 6h'],['24h','last 24h'],['7d','last 7d'],['30d','last 30d']];
@@ -122,7 +122,7 @@ function Calls(){
       <th title="prompt → completion tokens">in → out</th><th title="cache read / write tokens">cache</th><th title="tool schemas loaded">tools</th><th>ip / ua</th></tr>
     ${rows.map(r=>html`<tr class="click" onClick=${()=>openCall(r.id)} style=${fresh[r.id]?'background:oklch(0.740 0.160 152 / .10)':''}>
       <td class="mono mut" style="font-size:12px;white-space:nowrap">${fmtTime(r.ts)}</td>
-      <td>${r.project?html`<${Chip} cls="tag">${r.project}<//>`:html`<span class="mut" style="font-size:11px">(none)</span>`}</td>
+      <td><${ProjectChip} p=${r.project}/></td>
       <td class="mono" style="font-size:12px">${r.req_model||'-'}${r.sent_model&&r.sent_model!==r.req_model?html` <span class="mut">→ ${r.sent_model}</span>`:''}${r.stream?html` <span class="mut">stream</span>`:''}<${ParamBadges} r=${r}/></td>
       <td><${ProviderPill} provider=${r.provider}/></td>
       <td class="mono mut" style="font-size:12px">${r.key_label||''}</td>

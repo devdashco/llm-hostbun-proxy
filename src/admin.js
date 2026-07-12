@@ -746,7 +746,16 @@ async function handleAdminApi(req, res, path, prefix = "/api/") {
     if (q.provider) where.push(`provider = ${ph(String(q.provider))}`);
     if (q.model) where.push(`req_model = ${ph(String(q.model))}`);
     if (q.key) where.push(`key_label = ${ph(String(q.key))}`);
-    if (q.project) where.push(q.project === "(none)" ? "(project IS NULL OR project = '')" : `project = ${ph(String(q.project).toLowerCase())}`);
+    if (q.project) {
+      // A bare consumer name covers its jobs too (`promopilot` matches `promopilot:generatetext`),
+      // mirroring how routing resolves. A value with a colon is an exact job path; a TRAILING colon
+      // (`promopilot:`) is the consumer's job-less calls only — the stats drilldown needs all three.
+      const pj = String(q.project).toLowerCase();
+      if (pj === "(none)") where.push("(project IS NULL OR project = '')");
+      else if (pj.endsWith(":")) where.push(`project = ${ph(pj.slice(0, -1))}`);
+      else if (pj.includes(":")) where.push(`project = ${ph(pj)}`);
+      else where.push(`(project = ${ph(pj)} OR project LIKE ${ph(pj + ":%")})`);
+    }
     if (q.status === "error") where.push("status >= 400");
     else if (q.status === "ok") where.push("status < 400");
     else if (q.status) where.push(`status = ${ph(parseInt(q.status, 10))}`);
@@ -847,7 +856,9 @@ async function handleAdminApi(req, res, path, prefix = "/api/") {
           COUNT(*) FILTER (WHERE error LIKE 'json_validation_failed%')::int AS json_fails,
           COALESCE(SUM(total_tokens),0) AS tokens,
           COALESCE(SUM(prompt_tokens),0) AS ptok,
-          COALESCE(SUM(completion_tokens),0) AS ctok
+          COALESCE(SUM(completion_tokens),0) AS ctok,
+          COALESCE(SUM(cache_read),0) AS cache_read,
+          COALESCE(SUM(cache_write),0) AS cache_write
         FROM calls WHERE ${W}`, P) || {};
       const totalRow = await dbRow("SELECT COUNT(*)::int AS n FROM calls");
       const byProvider = await dbRows(`SELECT provider, COUNT(*)::int AS n, COALESCE(SUM(total_tokens),0) AS tok,
@@ -866,10 +877,12 @@ async function handleAdminApi(req, res, path, prefix = "/api/") {
       // SQLite does. One row per model is the shape the UI wants, so collapse provider explicitly.
       const byModel = await dbRows(`SELECT req_model, MAX(provider) AS provider, COUNT(*)::int AS n,
         COALESCE(SUM(total_tokens),0) AS tok,
-        COALESCE(SUM(prompt_tokens),0) AS ptok, COALESCE(SUM(completion_tokens),0) AS ctok, ROUND(AVG(duration_ms)) AS avg_ms
+        COALESCE(SUM(prompt_tokens),0) AS ptok, COALESCE(SUM(completion_tokens),0) AS ctok,
+        COALESCE(SUM(cache_read),0) AS cr, COALESCE(SUM(cache_write),0) AS cw, ROUND(AVG(duration_ms)) AS avg_ms
         FROM calls WHERE ${W} GROUP BY req_model ORDER BY tok DESC LIMIT 40`, P);
       const byProject = await dbRows(`SELECT COALESCE(NULLIF(project,''),'(none)') AS project, COUNT(*)::int AS n,
         COALESCE(SUM(total_tokens),0) AS tok, COALESCE(SUM(prompt_tokens),0) AS ptok, COALESCE(SUM(completion_tokens),0) AS ctok,
+        COALESCE(SUM(cache_read),0) AS cr, COALESCE(SUM(cache_write),0) AS cw,
         ROUND(AVG(duration_ms)) AS avg_ms, COUNT(*) FILTER (WHERE status>=400)::int AS errors,
         MAX(ts) AS last, COUNT(DISTINCT req_model)::int AS models, string_agg(DISTINCT provider, ',') AS providers
         FROM calls WHERE ${W} GROUP BY 1 ORDER BY tok DESC LIMIT 60`, P);
@@ -902,6 +915,7 @@ async function handleAdminApi(req, res, path, prefix = "/api/") {
       return sendJson(res, 200, { dbReady: true, window: winKey, total: totalRow ? totalRow.n : 0,
         windowCalls: agg.calls || 0, windowErrors: agg.errors || 0, windowTokens: agg.tokens || 0,
         windowPromptTokens: agg.ptok || 0, windowCompletionTokens: agg.ctok || 0, windowJsonFails: agg.json_fails || 0,
+        windowCacheRead: agg.cache_read || 0, windowCacheWrite: agg.cache_write || 0,
         windowCost: +windowCost.toFixed(4),
         pricedProviders: ["crazyrouter"], byProvider, byKey, byClient, byModel, byProject,
         oldest: oldestRow ? oldestRow.t : null, retain: CFG.logging.retain });
@@ -917,8 +931,12 @@ async function handleAdminApi(req, res, path, prefix = "/api/") {
       const q = url.parse(req.url, true).query;
       const WINDOWS = { "15m": 900000, "1h": 3600000, "6h": 21600000, "24h": 86400000, "7d": 604800000, "30d": 2592000000 };
       const winKey = (q.window in WINDOWS || q.window === "all") ? q.window : "24h";
-      const by = ["provider", "project", "model"].includes(q.by) ? q.by : "provider";
-      const groupCol = by === "provider" ? "provider" : by === "model" ? "req_model" : "COALESCE(NULLIF(project,''),'(none)')";
+      const by = ["provider", "project", "consumer", "model"].includes(q.by) ? q.by : "provider";
+      // consumer folds jobs: `promopilot:generatetext` and `promopilot:l1_metadata` chart as one
+      // series, so one busy consumer's jobs don't eat three of the top-8 series slots.
+      const groupCol = by === "provider" ? "provider" : by === "model" ? "req_model"
+        : by === "consumer" ? "split_part(COALESCE(NULLIF(project,''),'(none)'), ':', 1)"
+        : "COALESCE(NULLIF(project,''),'(none)')";
       const oldestRow = await dbRow("SELECT MIN(ts) AS t FROM calls");
       const oldest = (oldestRow && oldestRow.t) || Date.now();
       const span = winKey === "all" ? Math.max(60000, Date.now() - oldest) : WINDOWS[winKey];
