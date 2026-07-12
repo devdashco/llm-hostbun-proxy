@@ -44,6 +44,19 @@ The **first** incremental run has no cursor, so it starts at 0 and backfills eve
 is committed to the bucket after every verified batch, so a kill/timeout just means the next run
 resumes. No separate backfill step is required in normal operation.
 
+### Scheduled (production)
+
+`archive/run.sh` is the scheduled entrypoint. It sources config from keyvault (`llm-archive/config`,
+env-file fallback), finds the host's nvm `node` (the runner container has none of its own),
+fast-forward-updates the repo, holds a `flock` so an overlapping tick is a no-op, then runs the
+archiver (which reports to the beacon control plane itself).
+
+Scheduled as a **Coolify scheduled task** on the `scriptbox-pbox` app (`s18pl11n8t4v8i4jshsy39rg`),
+`17 * * * *` — **not** a local crontab (control-plane policy: every job is a Coolify task, visible in
+the scriptbox TUI + beacon). The runner has `network_mode: host`, so it reaches the LAN MinIO
+(`192.168.0.7:9100`) directly. Registered in the beacon as `llm-hostbun-archive`
+(alerts on fail/overdue).
+
 ### Env
 
 | var | default | notes |

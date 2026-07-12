@@ -15,7 +15,7 @@ refs may still linger in sibling repos.
   |---|---|
   | `config.js` | live `CFG`, env + `/data/config.json`, sanitizers, key index |
   | `identity.js` | consumer/job paths, API keys, `authenticate()` |
-  | `routing.js` | pins, allowlists, groups, usage limits, account pinning |
+  | `routing.js` | pins, allowlists, usage limits, account pinning |
   | `http.js` | `readBody`, `buildHeaders`, `proxy()`, JSON enforcement |
   | `db.js` | Postgres call log + harvested account headroom |
   | `claudecode.js` | Anthropic model catalog, per-account live usage-limit refresh |
@@ -89,8 +89,7 @@ volume, editable live from the panel at `/`. Changes apply without a redeploy.
 
 ### Per-project rules — pin vs allowlist
 
-`projectRoutes[<consumer>]` (and each `projectGroups[]` entry) carries **two independent axes**, and
-they are not the same thing:
+`projectRoutes[<consumer>]` carries **two independent axes**, and they are not the same thing:
 
 | field | what it does | on mismatch |
 |---|---|---|
