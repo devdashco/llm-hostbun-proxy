@@ -1,0 +1,80 @@
+{
+  "_comment": "Per-project plugin sets for cccc. A project's .claude/settings.json enabledPlugins REPLACES the global map (Claude Code does NOT merge it), so each repo's file must list the COMPLETE set = core + its packs. cccc's Plugins tab reads this and writes each repo's .claude/settings.json. Keys are name@marketplace (versionless -> survive plugin updates). Edit freely; unmapped repos get core only. Default marketplace is @devdash; overrides in _marketplace.",
+
+  "_marketplace": {
+    "typescript-lsp": "claude-plugins-official",
+    "pyright-lsp": "claude-plugins-official",
+    "gopls-lsp": "claude-plugins-official",
+    "php-lsp": "claude-plugins-official",
+    "ruby-lsp": "claude-plugins-official",
+    "swift-lsp": "claude-plugins-official",
+    "jdtls-lsp": "claude-plugins-official",
+    "claude-md-management": "claude-plugins-official",
+    "plugin-dev": "claude-plugins-official",
+    "frontend-design": "claude-plugins-official",
+    "skill-creator": "claude-plugins-official",
+    "mcp-server-dev": "claude-plugins-official",
+    "agent-sdk-dev": "claude-plugins-official",
+    "claude-code-setup": "claude-plugins-official",
+    "chrome-devtools-mcp": "claude-plugins-official",
+    "stripe": "claude-plugins-official",
+    "serena": "claude-plugins-official",
+    "screaming-frog": "screaming-frog-mcp",
+    "headroom": "headroom-marketplace",
+    "terminal": "gfargo-skills"
+  },
+
+  "core": [
+    "keyvault", "claudectl", "ssh-pbox", "ssh-hostbun", "ssh-lprod", "headroom",
+    "typescript-lsp", "pyright-lsp", "gopls-lsp", "php-lsp", "ruby-lsp", "swift-lsp", "jdtls-lsp",
+    "claude-md-management", "plugin-dev", "fix-codebase", "frontend-design", "terminal",
+    "agent-reach", "skill-creator", "mcp-server-dev", "agent-sdk-dev", "claude-code-setup"
+  ],
+
+  "packs": {
+    "coolify-hostbun": ["coolify-hostbun"],
+    "coolify-pbox": ["coolify-pbox"],
+    "coolify-hetzner": ["coolify-hetzner"],
+    "seo": ["seo-plugin", "gsc-server", "screaming-frog"],
+    "browser": ["local-browser-control", "computer-control", "chrome-devtools-mcp"],
+    "gologin": ["cloakbox", "identities", "capsolver"],
+    "mantal": ["mantal-cms", "mantal-db-prod"],
+    "db-staging": ["supabase-staging"],
+    "db-hostbun": ["supabase-hostbun"],
+    "db-local": ["supabase-local"],
+    "debug": ["hyperdx"],
+    "mail": ["mailmcp"],
+    "proxy": ["proxybun"],
+    "scriptbox": ["scriptbox"],
+    "search": ["searxng"],
+    "cloud": ["cloudflare", "ovh"],
+    "aws": ["aws"],
+    "ms365": ["ms365"],
+    "nas-db": ["app-db-nas"],
+    "emphyx": ["emphyx", "vercel", "chromebox", "ssh-hetzner"],
+    "serena": ["serena"]
+  },
+
+  "projects": {
+    "claudectl": ["coolify-hostbun", "coolify-pbox", "debug"],
+    "promopilot": ["seo", "db-staging", "coolify-hostbun"],
+    "funnel-sites": ["seo", "coolify-hostbun"],
+    "mantal": ["mantal", "db-staging", "coolify-pbox"],
+    "proxybun": ["proxy", "coolify-pbox"],
+    "droidfleet": ["gologin", "scriptbox"],
+    "fb-bot": ["gologin", "cloud"],
+    "bluebut": ["db-hostbun", "gologin", "serena"],
+    "mailmcp": ["mail", "coolify-hostbun"],
+    "bofrid": ["db-staging", "debug", "coolify-hostbun"],
+    "recon": ["mantal", "db-hostbun", "search"],
+    "agentic-marketplace": ["db-staging", "coolify-hostbun"],
+    "bofrid-data-pipeline": ["db-staging", "coolify-hostbun"],
+    "monorepo-bofrid-old": ["db-staging", "debug"],
+    "emphyx": ["emphyx", "db-local", "coolify-hostbun"],
+    "airbyte": ["db-hostbun", "coolify-hostbun"],
+    "bibi": ["coolify-hostbun"],
+    "ddashtool": ["coolify-hostbun", "coolify-pbox", "coolify-hetzner", "debug"],
+    "toolbox": ["nas-db"],
+    "hitta-fetcher-mini": ["mantal", "browser", "debug"]
+  }
+}

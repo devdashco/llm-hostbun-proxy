@@ -1,0 +1,7 @@
+{
+  "claudectl": {
+    "type": "stdio",
+    "command": "sh",
+    "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/claudectl_launch.sh"]
+  }
+}
