@@ -16,6 +16,12 @@ LOG="${LLM_ARCHIVE_LOG:-$HOME/.llm-archive/archive.log}"
 mkdir -p "$(dirname "$LOG")"
 SLUG="llm-hostbun-archive"
 
+# Single-instance: an incremental run can outlast the hourly tick (a big catch-up), and two writers
+# racing on the bucket cursor could rewind it. flock makes an overlapping cron fire a no-op.
+LOCK="$HOME/.llm-archive/run.lock"
+exec 9>"$LOCK"
+if ! flock -n 9; then echo "$(date -u +%FT%TZ) another run holds the lock; skipping" >>"$LOG"; exit 0; fi
+
 # ── load config ──────────────────────────────────────────────────────────────
 # Try keyvault first (JSON at llm-archive/config → export each key). Falls back to the env file.
 KV_URL="${KEYVAULT_URL:-https://keyvault.hostbun.cc/mcp}"
