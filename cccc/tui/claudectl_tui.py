@@ -534,6 +534,25 @@ def _version_check(autosync: bool = True) -> dict:
     return _VER
 
 
+# Doctor runs automatically at every launch (background) — the header shows a
+# ✓/✗ chip and the Setup tab the first finding, so a broken LSP/env surfaces
+# without anyone remembering to press the button.
+_DOC: dict = {}   # {"ok": bool|None, "n": int, "first": str}
+
+
+def _doctor_check() -> dict:
+    global _DOC
+    try:
+        r = subprocess.run([sys.executable, _DOCTOR_SCRIPT],
+                           capture_output=True, text=True, timeout=90)
+        bad = [ln.strip() for ln in (r.stdout or "").splitlines()
+               if ln.strip().startswith("✗")]
+        _DOC = {"ok": not bad, "n": len(bad), "first": bad[0][:70] if bad else ""}
+    except Exception as e:  # noqa: BLE001
+        _DOC = {"ok": None, "n": 0, "first": f"doctor failed: {type(e).__name__}"}
+    return _DOC
+
+
 def _claude_surfaces() -> list[str]:
     import re as _re
     out = subprocess.run(["ps", "-Ao", "pid=,args="], capture_output=True, text=True).stdout
@@ -1001,10 +1020,18 @@ _SETUP_ITEMS = [
      "here, script executes). Launch already auto-checks + auto-syncs; this "
      "forces it now and shows the result."),
     ("health check (doctor)", "doctor",
-     "Check LSP / environment health on this machine (the old separate `cccd`)."),
+     "Check LSP / environment health on this machine (the old separate `cccd`). "
+     "Runs automatically at every launch — the ✓/✗ chip in the title bar is its "
+     "latest verdict; this shows the full report."),
+    ("doctor --fix (enable missing LSPs)", "doctor_fix",
+     "Enable the missing LSP plugins doctor found, at user scope, then re-check."),
     ("update this tool (sync)", "sync",
      "git-pull this cccc checkout onto the latest code and re-vendor. Asks whether "
-     "to also restart running ccc windows."),
+     "to also restart running ccc windows. Launch already auto-syncs when behind."),
+    ("project dock links (dock)", "dock",
+     "Open the per-project Dock link editor (the old `cccc dock` CLI) in place."),
+    ("pane layouts (panes)", "panes",
+     "Open the cmux pane-layout tool (the old `cccc panes` CLI) in place."),
 ]
 
 # Plugins tab — pool-wide actions, shown BELOW the project list.
@@ -1104,6 +1131,7 @@ def run(stdscr):
     import threading
     threading.Thread(target=_live_worker, daemon=True).start()   # LIVE 7d/usable in bg
     threading.Thread(target=_version_check, daemon=True).start()  # auto-update check
+    threading.Thread(target=_doctor_check, daemon=True).start()   # auto health check
 
     # -- tabs: the ONLY top-level navigation. ←/→ switch tab, ↑/↓ move within it,
     #    ↵ selects/opens, q quits. No letter hotkeys anywhere. -----------------
@@ -1238,7 +1266,20 @@ def run(stdscr):
         elif action == "doctor":
             busy("running doctor…")
             _run_external(stdscr, ["python3", _DOCTOR_SCRIPT])
+            _doctor_check()                       # refresh the header chip too
             ok("doctor done")
+            stdscr.timeout(REFRESH_MS)
+        elif action == "doctor_fix":
+            busy("doctor --fix (enabling missing LSP plugins)…")
+            _run_external(stdscr, ["python3", _DOCTOR_SCRIPT, "--fix"])
+            _doctor_check()
+            ok("doctor --fix done" + ("" if _DOC.get("ok") else f" · {_DOC.get('n')} issue(s) remain"))
+            stdscr.timeout(REFRESH_MS)
+        elif action == "dock":
+            _run_external(stdscr, ["python3", _DOCK_SCRIPT])
+            stdscr.timeout(REFRESH_MS)
+        elif action == "panes":
+            _run_external(stdscr, ["python3", _PANES_SCRIPT])
             stdscr.timeout(REFRESH_MS)
         elif action == "sync":
             restart = _confirm(stdscr, "sync: git-pull this checkout. also restart ccc panes onto new code?")
@@ -1337,16 +1378,21 @@ def run(stdscr):
         stdscr.addstr(0, 0, " " * w, C_HEADER)
         put(0, 1, "claudectl", C_HEADER)
         x0 = put(0, 11, f"cccc · {host_str}", curses.color_pair(7))
-        # version chip from the launch-time check (background thread fills _VER)
+        # version + doctor chips from the launch-time background checks
         _vst = _VER.get("state", "")
         if _vst == "latest":
-            put(0, x0 + 1, f"✓{_VER['sha']}", curses.color_pair(7) | curses.A_DIM)
+            x0 = put(0, x0 + 1, f"✓{_VER['sha']}", curses.color_pair(7) | curses.A_DIM)
         elif _vst == "updated":
-            put(0, x0 + 1, "⬆ updated — restart cccc", C_WARN | curses.A_BOLD)
+            x0 = put(0, x0 + 1, "⬆ updated — restart cccc", C_WARN | curses.A_BOLD)
         elif _vst == "behind":
-            put(0, x0 + 1, f"⬆ {_VER.get('behind', '?')} behind — Setup→sync", C_WARN)
+            x0 = put(0, x0 + 1, f"⬆ {_VER.get('behind', '?')} behind — Setup→sync", C_WARN)
         elif _vst == "err":
-            put(0, x0 + 1, "version check failed", curses.A_DIM)
+            x0 = put(0, x0 + 1, "ver?", curses.A_DIM)
+        if _DOC:
+            if _DOC.get("ok"):
+                put(0, x0 + 1, "· doctor✓", curses.color_pair(7) | curses.A_DIM)
+            else:
+                put(0, x0 + 1, f"· doctor {_DOC.get('n') or '?'}✗ → Setup", C_WARN)
         put(0, max(11, w - len(dot) - 1), dot,
             curses.color_pair(7) | (curses.A_BOLD if _LIVE else curses.A_DIM))
         tx = 1
@@ -1370,8 +1416,9 @@ def run(stdscr):
             put(4, 0, ("  bars = % USED (green ok · yellow busy · red almost gone)  ·  "
                        "WEEKLY is the binding limit  ·  ★ pinned acct  ● gateway active")[:w], C_DIM)
             # column x-positions must mirror the row draw below: mark(2) + name(12)
-            # + ·org(6) + state(9) + weekly bar(11) + " · reset"(9) + " date"(11) + " " + 5h bar(11)
-            put(5, 0, f"  {'ACCOUNT':<12}{'ORG':<6}{'STATE':<9}{'WEEKLY':<11}{' · RESETS':<9}{' (DATE)':<11} {'5-HOUR':<11}  BOX",
+            # + ·org(6) + state(9) + weekly bar(11) + " · reset"(9) + " date"(11)
+            # + " " + 5h bar(11) + " · reset"(9)
+            put(5, 0, f"  {'ACCOUNT':<12}{'ORG':<6}{'STATE':<9}{'WEEKLY':<11}{' · RESETS':<9}{' (DATE)':<11} {'5-HOUR':<11}{' · RESETS':<9}  BOX",
                 C_ACCENT | curses.A_UNDERLINE)
             if data["err"]:
                 put(h - 5, 2, f"! {data['err']}"[:w - 3], C_HOT)
@@ -1414,9 +1461,11 @@ def run(stdscr):
                     reset = (r.get("r7") or "").replace(" ", "") or "—"
                 x = put(y, x, f" · {reset:<6}", C_DIM | rev)
                 x = put(y, x, f" {r.get('d7') or '':<10}", C_DIM | rev)
-                # 5-HOUR: used-bar + %
+                # 5-HOUR: used-bar + %, then ITS reset countdown
                 x = put(y, x, " ", rev)
                 x = draw_used_bar(y, x, u5, rev)
+                r5 = (r.get("r5") or "").replace(" ", "") or "—"
+                x = put(y, x, f" · {r5:<6}", C_DIM | rev)
                 # BOX: machines verified on this account
                 machs = r.get("machines") or []          # boxes verified on this account
                 if machs and x < w - 2:
@@ -1497,6 +1546,14 @@ def run(stdscr):
             items = _TAB_ITEMS[tab_key]
             put(2, 0, {"windows": "  Windows — every action hits ALL your running claude/ccc windows",
                        "setup": "  Setup — maintain the cccc tool on this machine"}[tab_key][:w], C_DIM)
+            if tab_key == "setup":
+                # live verdicts from the launch-time background checks
+                _v = _VER.get("state", "checking…")
+                _dline = ("doctor: checking…" if not _DOC else
+                          "doctor: ✓ all good" if _DOC.get("ok") else
+                          f"doctor: {_DOC.get('n')}✗ · {_DOC.get('first', '')}")
+                put(3, 2, f"version: {_VER.get('sha', '?')} ({_v})   ·   {_dline}"[:w - 3],
+                    C_WARN if (_DOC and not _DOC.get("ok")) or _v in ("behind", "updated") else C_DIM)
             render_list(items, list_sel[tab_key], 4)
             put(h - 2, 0, "←→ tab   ↑↓ move   ↵ run   q quit"[:w], C_DIM)
 
