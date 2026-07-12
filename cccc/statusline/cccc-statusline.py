@@ -20,7 +20,6 @@ identical to your own keychain pin):
                                 keychain token cccc pinned. YOUR account, no gateway.
     📡acct·llm.hostbun.cc       gateway pool picks/bills the account SERVER-side
                                 (`⚠auto` = this box is unmapped and rotating)
-    ☁️acct·claude.hostbun.cc    claudebox wrapper's load-balancer
     🌐host·gateway              some other base URL
     🔑key·BILLED                pay-per-token API key (not a subscription)
 
@@ -459,23 +458,11 @@ def _account():
     The ICON encodes the ROUTE and is never reused across routes — so you can always tell
     at a glance whether the account is YOUR keychain pin or one a gateway picked for you:
       👤 direct   — no base URL; keychain token (cccc's pin) → api.anthropic.com
-      📡 gateway  — llm.hostbun.cc pool / claude.hostbun.cc /gw (account chosen SERVER-side)
-      ☁️ wrapper  — claude.hostbun.cc (claudebox load-balancer)
+      📡 gateway  — llm.hostbun.cc pool (account chosen SERVER-side via /api/pins)
       🌐 other gateway     🔑 api key (billed)
     """
     base = os.environ.get("ANTHROPIC_BASE_URL", "")
     if base:
-        if "claude.hostbun.cc" in base and "/gw" in base:
-            ch = os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "").replace("\\n", "\n")
-            pin = next((p.split(":", 1)[1].strip() for p in ch.splitlines()
-                        if p.lower().startswith("x-ccc-account:")), "")
-            return ("📡", pin or "auto", _route_tag("claude.hostbun.cc/gw"))
-        if "claude.hostbun.cc" in base:
-            try:
-                acct = open(f"{HOME}/.claude/cc-profile.cache").read().strip()
-            except OSError:
-                acct = ""
-            return ("☁️", acct or "sub", _route_tag("claude.hostbun.cc"))
         if "llm.hostbun.cc" in base:
             # The GATEWAY decides the account server-side: it resolves THIS box's consumer id
             # against its consumerAccounts LOCK map and bills that account — the pane's own

@@ -11,7 +11,8 @@
 #
 # Same file works on every box (pmac dev clone, pbox/wmac deploy clone); each box's
 # account + identity ride in ~/.claude/settings.json env.ANTHROPIC_CUSTOM_HEADERS
-# (X-Consumer / X-Lane / X-Account), written by cccc. This only decides base URL.
+# (X-Consumer / X-Project), written by cccc. Account selection is the router's
+# server-side pin map (/api/pins) — headers can't override it. This only decides base URL.
 
 _cctl_gateway_route() {
   local url="https://llm.hostbun.cc" cache="$HOME/.claude/.cctl-gw" ttl=45 now state="" ts st
@@ -21,7 +22,7 @@ _cctl_gateway_route() {
     [ -n "$ts" ] && [ "$((now - ts))" -lt "$ttl" ] && state="$st"
   fi
   if [ -z "$state" ]; then
-    if command -v curl >/dev/null 2>&1 && curl -s -m 2 -o /dev/null "$url/admin" 2>/dev/null; then
+    if command -v curl >/dev/null 2>&1 && curl -sf -m 2 -o /dev/null "$url/v1/models" 2>/dev/null; then
       state=up
     else
       state=down

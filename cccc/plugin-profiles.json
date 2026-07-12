@@ -57,6 +57,7 @@
 
   "projects": {
     "claudectl": ["coolify-hostbun", "coolify-pbox", "debug"],
+    "llm-hostbun-router": ["coolify-hostbun", "coolify-pbox", "debug"],
     "promopilot": ["seo", "db-staging", "coolify-hostbun"],
     "funnel-sites": ["seo", "coolify-hostbun"],
     "mantal": ["mantal", "db-staging", "coolify-pbox"],

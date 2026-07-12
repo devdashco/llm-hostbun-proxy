@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
-"""claudectl TUI — a curses dashboard for the claudebox wrapper accounts on the
-account gateway (claude.hostbun.cc).
+"""claudectl TUI — a curses dashboard for the Claude Max account pool behind the
+llm.hostbun.cc router (the ONLY gateway; claude.hostbun.cc is retired).
 
-Same REST API the MCP wraps, but hands-on: watch every account's live 5h/7d
-usage + reset countdown, pin the active login, add/delete accounts, run a
-test, reset local tallies — without leaving the terminal. Pure stdlib
+Drives the router's /api/* control plane, hands-on: watch every account's live
+5h/7d usage + reset countdown, pin this box's account (server-side /api/pins),
+run a live limit check — without leaving the terminal. Pure stdlib
 (curses + urllib), no deps, runs anywhere.
 
-Navigation is ARROWS + ENTER ONLY — no letter hotkeys. ←/→ switch the three
-tabs (Accounts · Windows · Setup), ↑/↓ move within a tab, ↵ opens the
+Navigation is ARROWS + ENTER ONLY — no letter hotkeys. ←/→ switch the
+tabs (Accounts · Windows · Plugins · Setup), ↑/↓ move within a tab, ↵ opens the
 selected account's action menu (or runs the highlighted list action), q quits.
-  Accounts — your Claude logins: pin one, add/remove, see 5h/7d limits.
+  Accounts — the pool: pin one to this box, live 5h/7d limits, remove.
   Windows  — restart / set model / broadcast to ALL your running claude windows.
   Setup    — maintain the cccc tool itself (health check, update).
 
 Run:
-  python3 claudectl_tui.py                      # defaults, bearer ddash
-  CLAUDECTL_BEARER=xxx python3 claudectl_tui.py
+  python3 claudectl_tui.py
 
 Env:
-  CLAUDECTL_BEARER   upstream bearer (default ddash)
-  CLAUDE_HOST        account gateway (default https://claude.hostbun.cc)
-  SWITCH_PASSWORD    forwarded on mutations if the gateway requires it
+  CCTL_LLM_ADMIN     the router (default https://llm.hostbun.cc)
+  CCTL_LLM_PW        admin password (default ddash)
+  CLAUDECTL_MCP      fleet-presence registry (default https://claudectl.hostbun.cc)
 """
 from __future__ import annotations
 
@@ -109,22 +108,22 @@ def _consumer_name() -> str:
 
 
 # header lines cccc owns on the proxy contract — rewritten on every switch, everything
-# else in ANTHROPIC_CUSTOM_HEADERS is preserved. (x-ccc-account = legacy alias, dropped.)
+# else in ANTHROPIC_CUSTOM_HEADERS is preserved. (x-lane / x-account / x-ccc-account =
+# legacy: the router IGNORES account headers by design — invariant "no header can
+# override the pin" — so we strip them on every rewrite and never emit them again.)
 _MANAGED_HDRS = ("x-consumer:", "x-project:", "x-lane:", "x-account:", "x-ccc-account:")
 
 
-def set_consumer_headers(account: str, lane: str = "anthropic") -> bool:
-    """Write THIS box's full middleware header contract into
+def set_consumer_headers(account: str = "") -> bool:
+    """Write THIS box's identity headers into
     ~/.claude/settings.json env.ANTHROPIC_CUSTOM_HEADERS:
 
         X-Consumer: <box>          who is calling (pmac/wmac/pbox) — attribution/logging
-        X-Project:  <box>-claude   satisfies the proxy's requireProject gate
-        X-Lane:     anthropic      the lane we want (interactive/own lane)
-        X-Account:  <account>      which pool account to bill (per-consumer lock)
+        X-Project:  <box>-claude   satisfies the router's requireProject gate
 
-    The llm.hostbun.cc proxy reads X-Account to LOCK the anthropic lane to that pool
-    account (server-side; the box's keychain token is irrelevant on this lane). So the
-    account is decided ONCE, here, and captured centrally. New claude launches pick the
+    ACCOUNT selection is NOT a header: the router picks the pool account from its
+    server-side pin map (/api/pins) and explicitly ignores X-Account. `account` is
+    accepted for call-site symmetry but unused. New claude launches pick the
     headers up; a running pane keeps its launch env until restart. Returns ok."""
     consumer = _consumer_name()
     p = os.path.expanduser("~/.claude/settings.json")
@@ -140,8 +139,7 @@ def set_consumer_headers(account: str, lane: str = "anthropic") -> bool:
     # keep any header we don't manage; replace our whole managed set
     kept = [ln for ln in raw.replace("\\n", "\n").splitlines()
             if ln.strip() and not ln.lower().lstrip().startswith(_MANAGED_HDRS)]
-    kept += [f"X-Consumer: {consumer}", f"X-Project: {consumer}-claude",
-             f"X-Lane: {lane}", f"X-Account: {account}"]
+    kept += [f"X-Consumer: {consumer}", f"X-Project: {consumer}-claude"]
     env["ANTHROPIC_CUSTOM_HEADERS"] = "\n".join(kept)
     try:
         tmp = p + ".tmp"
@@ -197,33 +195,37 @@ def _refresh_statusline_account() -> None:
 
 
 def gateway_set_lock(account: str, consumer: str = "") -> dict:
-    """THE robust account switch: set THIS box's consumer→account in the gateway's
-    server-side consumerAccounts LOCK map (llm.hostbun.cc). The gateway then bills every
-    pane on this box to `account` LIVE — no restart. Uses a CACHED admin cookie so it
-    doesn't re-login every switch (which would trip the per-IP login throttle); only
-    logs in when the cookie is missing/expired. Returns {ok, error?}."""
+    """THE robust account switch: pin THIS box's consumer→account in the router's
+    server-side pin map via POST /api/pins (llm.hostbun.cc). The router then bills every
+    pane on this box to `account` LIVE — no restart. /api/pins MERGES one key and
+    validates the account name; the old POST /api/config {consumerAccounts} path was a
+    silent no-op for already-pinned consumers (the wholesale merge let the stale
+    projectAccounts clone win). Uses a CACHED admin cookie so it doesn't re-login every
+    switch (which would trip the per-IP login throttle). Returns {ok, error?}."""
     consumer = (consumer or _consumer_name()).lower()
     op, cj = _llm_admin_opener()
 
     def _apply():
-        st = json.load(op.open(f"{LLM_ADMIN}/api/state", timeout=10))
-        cmap = dict(st.get("consumerAccounts") or {})
-        cmap[consumer] = account
-        cmap[f"{consumer}-claude"] = account   # panes that identify only via X-Project
-        r = op.open(urllib.request.Request(f"{LLM_ADMIN}/api/config",
-                    data=json.dumps({"consumerAccounts": cmap}).encode(),
-                    headers={"content-type": "application/json"}, method="POST"), timeout=10)
-        ok = bool(json.load(r).get("ok", False))
-        if ok:
-            _refresh_statusline_account()   # so the statusline shows the new account LIVE
-        return ok
+        for proj in (consumer, f"{consumer}-claude"):   # panes may identify via either
+            r = op.open(urllib.request.Request(f"{LLM_ADMIN}/api/pins",
+                        data=json.dumps({"project": proj, "account": account}).encode(),
+                        headers={"content-type": "application/json"}, method="POST"), timeout=10)
+            if not bool(json.load(r).get("ok", False)):
+                return False
+        _refresh_statusline_account()   # so the statusline shows the new account LIVE
+        return True
 
     # 1) try with the cached cookie (no login → no throttle)
     try:
         return {"ok": _apply()}
     except urllib.error.HTTPError as e:
         if e.code not in (401, 403):
-            return {"ok": False, "error": f"gateway HTTP {e.code}"}
+            # /api/pins 400s with a useful body (e.g. unknown account + the pool names)
+            try:
+                detail = json.loads(e.read().decode()).get("error", "")
+            except Exception:  # noqa: BLE001
+                detail = ""
+            return {"ok": False, "error": f"router HTTP {e.code}" + (f": {detail}" if detail else "")}
         # cookie missing/expired → fall through to a single login
     except Exception:
         pass
@@ -315,103 +317,6 @@ def _kc_read() -> dict:
         return {}
 
 
-def _kc_write(obj: dict) -> bool:
-    if _IS_MAC:
-        try:
-            r = subprocess.run(["security", "add-generic-password", "-U", "-s", KC_SVC,
-                                "-a", KC_ACCT, "-w", json.dumps(obj)],
-                               capture_output=True, text=True, timeout=10)
-            return r.returncode == 0
-        except Exception:
-            return False
-    try:
-        os.makedirs(os.path.dirname(CRED_FILE), exist_ok=True)
-        tmp = CRED_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(obj, f)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, CRED_FILE)
-        return True
-    except Exception:
-        return False
-
-
-def local_apply(name: str) -> dict:
-    """Make `name` the LOCAL Mac login: pull its long-lived token from the gateway
-    and write it into the keychain so NEW `claude` sessions use it. Returns
-    {ok, error?}. Running sessions keep their token until restart."""
-    tok = _req("claude", "POST", "/v1/accounts/token", {"name": name})
-    token = tok.get("token") if isinstance(tok, dict) else None
-    if not token:
-        return {"ok": False, "error": tok.get("error", "no token from gateway")}
-    # SUBSCRIPTION-ONLY GUARD: never put a pay-per-token API key in the login. Max
-    # OAuth tokens are `sk-ant-oat…`; an `sk-ant-api…` key would bill real money and
-    # (worse) let claude keep working past the subscription limit on paid credits.
-    # Refuse anything that isn't an OAuth token so a limit ALWAYS just blocks.
-    if not str(token).startswith("sk-ant-oat"):
-        kind = "API key (sk-ant-api — BILLED)" if str(token).startswith("sk-ant-api") else "unknown token type"
-        return {"ok": False, "error": f"refused: {name} is a {kind}, not a Max subscription (sk-ant-oat). "
-                                      "Subscription-only — not applying."}
-    blob = _kc_read()
-    if not isinstance(blob, dict):
-        blob = {}
-    blob["claudeAiOauth"] = {
-        "accessToken": token,
-        "refreshToken": "",
-        "expiresAt": tok.get("expiresAt") or 4102444800000,
-        "scopes": ["user:inference"],
-        "subscriptionType": "max",
-        "isOauthToken": True,
-    }
-    if not _kc_write(blob):
-        return {"ok": False, "error": "keychain write failed (security cmd)"}
-    # probe the token against real Anthropic so we don't silently land on a dead login
-    valid = None
-    try:
-        pr = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=json.dumps({"model": "claude-haiku-4-5-20251001", "max_tokens": 1,
-                             "messages": [{"role": "user", "content": "hi"}]}).encode(),
-            headers={"authorization": f"Bearer {token}", "anthropic-version": "2023-06-01",
-                     "anthropic-beta": "oauth-2025-04-20,claude-code-20250219",
-                     "content-type": "application/json"}, method="POST")
-        urllib.request.urlopen(pr, timeout=20)
-        valid = True
-    except urllib.error.HTTPError as e:
-        valid = e.code != 401  # 429 (rate limit) still means the token is accepted
-    except Exception:
-        valid = None  # network hiccup — don't claim dead
-    # best-effort: patch ~/.claude.json so the statusline shows the right identity
-    try:
-        p = os.path.expanduser("~/.claude.json")
-        d = json.load(open(p))
-        oa = d.get("oauthAccount") or {}
-        oa["emailAddress"] = acct_email(name) or f"{name}@claudectl"
-        oa["displayName"] = name
-        d["oauthAccount"] = oa
-        tmp = p + ".tmp"
-        json.dump(d, open(tmp, "w"))
-        os.replace(tmp, p)
-    except Exception:
-        pass
-    _write_local_selected(name)  # remember: this is the local login now
-    # ALSO write the proxy header contract: when this box routes through llm.hostbun.cc
-    # the keychain is IGNORED on the anthropic lane (the proxy bills the pool account named
-    # by X-Account), so this is what actually moves the account. Emits the full consumer
-    # contract (X-Consumer/X-Project/X-Lane/X-Account). Harmless off the proxy (direct
-    # claude ignores custom headers). New launches use it; a live pane needs a restart.
-    set_consumer_headers(name)
-    # bust the statusline's API-verified cache so the line re-resolves on its very
-    # next render instead of lagging a stale name (up to 30 min) behind the switch.
-    for _p in ("~/.claude/.cctl-whoami", "~/.claude/.cctl-whoami-stamp"):
-        try:
-            os.remove(os.path.expanduser(_p))
-        except OSError:
-            pass
-    return {"ok": True, "valid": valid}
-
-BEARER = os.environ.get("CLAUDECTL_BEARER", os.environ.get("UPSTREAM_BEARER", "ddash"))
-SWITCH_PASSWORD = os.environ.get("SWITCH_PASSWORD", "").strip()
 # claudectl MCP server — holds the cross-machine fleet presence registry (which
 # box is on which account, each box's statusline verifies + publishes its own).
 MCP_BASE = os.environ.get("CLAUDECTL_MCP", "https://claudectl.hostbun.cc").rstrip("/")
@@ -429,85 +334,65 @@ def _mcp_get(path: str) -> dict:
         return d if isinstance(d, dict) else {}
     except Exception:
         return {}
-HOSTS = {
-    # Legacy claudebox base — retired. Accounts/limits now come from the llm.hostbun.cc
-    # router via _llm_json()/fetch(); this only backs a few dead lifecycle ops kept for
-    # display. Defaults to the router so any stray call fails fast on the live host.
-    "claude": os.environ.get("CLAUDE_HOST", LLM_ADMIN).rstrip("/"),
-}
-HOST = "claude"     # account dashboard always targets the gateway; no host toggle
+
+
 REFRESH_MS = 2000   # auto-refetch from the router every 2s (always latest)
 
-
-# ---------------------------------------------------------------- http
-def _req(host_key: str, method: str, path: str, body: dict | None = None,
-         timeout: float = 30) -> dict:
-    url = HOSTS[host_key] + path
-    data = None
-    headers = {"Authorization": f"Bearer {BEARER}", "Accept": "application/json"}
-    if method == "POST":
-        body = dict(body or {})
-        if SWITCH_PASSWORD and "password" not in body:
-            body["password"] = SWITCH_PASSWORD
-        data = json.dumps(body).encode()
-        headers["Content-Type"] = "application/json"
-    r = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(r, timeout=timeout) as resp:
-            return json.loads(resp.read().decode() or "{}")
-    except urllib.error.HTTPError as e:
-        try:
-            return json.loads(e.read().decode())
-        except Exception:
-            return {"ok": False, "error": f"HTTP {e.code}"}
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:160]}
-
-
 # ---------------------------------------------------------------- LIVE limits
-# The gateway's /v1/accounts/limits is CACHED and can badly understate the 7-DAY
-# usage (it showed 73% when live was 100%). The 7-day window is usually the real
-# binding limit — an account can have a fresh 5h yet be DEAD for ~a day on its 7d.
-# So a background worker probes Anthropic's LIVE rate-limit headers per account
-# (reveal token -> 1-token message -> read headers) and fills _LIVE. Costs one tiny
-# message per account per refresh, so the cadence is slow (default 60s).
+# _LIVE holds the freshest per-account usable/5h/7d summary, filled by a background
+# worker off the router's harvested /api/limits (free — no probe). The "⚡ LIVE limit
+# check" menu action additionally POSTs /api/claudecode/limits {all:true}, which makes
+# the ROUTER ping each subscription once for fresh headers (1 token per account).
 _LIVE: dict = {}
 _LIVE_AT = 0.0
-_CC_SYS = "You are Claude Code, Anthropic's official CLI for Claude."
 LIVE_INTERVAL = int(os.environ.get("CLAUDECTL_LIVE_INTERVAL", "90"))
+# cross-machine fleet presence, refreshed in the same background worker so a dead
+# presence host can never stall the UI thread (it used to block fetch() up to 6s).
+_PRES: dict = {}
 
 
-def _probe_one(token: str) -> dict:
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=json.dumps({"model": "claude-haiku-4-5-20251001", "max_tokens": 1,
-                         "system": _CC_SYS, "messages": [{"role": "user", "content": "."}]}).encode(),
-        headers={"authorization": f"Bearer {token}", "anthropic-version": "2023-06-01",
-                 "anthropic-beta": "oauth-2025-04-20,claude-code-20250219",
-                 "content-type": "application/json"}, method="POST")
+def _llm_post(sub: str, body: dict | None = None, timeout: float = 30):
+    """POST llm.hostbun.cc/api/<sub> as JSON, cookie-authed like _llm_json. Never
+    raises — returns {"error": ...} on failure. Used for the mutating/live endpoints
+    (claudecode/limits, accounts/remove)."""
+    op, cj = _llm_admin_opener()
+
+    def _post():
+        r = op.open(urllib.request.Request(f"{LLM_ADMIN}/api/{sub}",
+                    data=json.dumps(body or {}).encode(),
+                    headers={"content-type": "application/json"}, method="POST"),
+                    timeout=timeout)
+        return json.loads(r.read().decode() or "{}")
     try:
-        h = urllib.request.urlopen(req, timeout=20).headers
+        return _post()
     except urllib.error.HTTPError as e:
-        h = e.headers            # 429 still carries the rate-limit headers
-    except Exception:
-        return {}
-
-    def g(k):
-        return h.get(f"anthropic-ratelimit-unified-{k}")
-
-    def futs(k):
+        if e.code not in (401, 403):
+            try:
+                return json.loads(e.read().decode())
+            except Exception:  # noqa: BLE001
+                return {"error": f"HTTP {e.code}"}
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}"[:120]}
+    # cookie missing/expired → one login, cache it, retry
+    try:
+        op.open(urllib.request.Request(f"{LLM_ADMIN}/api/login",
+                data=json.dumps({"password": LLM_PW}).encode(),
+                headers={"content-type": "application/json"}), timeout=timeout).read()
         try:
-            return max(0, round((int(g(k)) - time.time()) / 3600, 1))
-        except Exception:
-            return None
-    return {
-        "u5": float(g("5h-utilization") or 0) * 100,
-        "u7": float(g("7d-utilization") or 0) * 100,
-        "s5": g("5h-status"), "s7": g("7d-status"),
-        "reset5_h": futs("5h-reset"), "reset7_h": futs("7d-reset"),
-        "binding": g("representative-claim"),
-        "usable": g("status") != "rejected",
-    }
+            os.makedirs(os.path.dirname(_ADMIN_COOKIE), exist_ok=True)
+            cj.save(ignore_discard=True, ignore_expires=True)
+            os.chmod(_ADMIN_COOKIE, 0o600)
+        except OSError:
+            pass
+    except urllib.error.HTTPError as e:
+        return {"error": ("admin login throttled — wait ~1 min (fleet shares one IP)"
+                          if e.code == 429 else f"admin login HTTP {e.code}")}
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"admin login failed: {e}"[:120]}
+    try:
+        return _post()
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}"[:120]}
 
 
 def _live_refresh():
@@ -541,9 +426,14 @@ def _live_refresh():
 
 # ---------------------------------------------------------------- live worker
 def _live_worker():
+    global _PRES
     while True:
         try:
             _live_refresh()
+        except Exception:
+            pass
+        try:
+            _PRES = _mcp_get("/presence")   # off the UI thread — a dead host costs nothing
         except Exception:
             pass
         time.sleep(LIVE_INTERVAL)
@@ -732,7 +622,7 @@ def _remain_frac(iso: str | None, window_h: float = 168.0):
     return max(0.0, min(1.0, rem_h / window_h))
 
 
-def fetch(host_key: str) -> dict:
+def fetch() -> dict:
     """Accounts + live 5h/7d, sourced from the llm.hostbun.cc router (the ONLY
     gateway now — claude.hostbun.cc is retired). /api/state → claudecodeAccountPool
     (name↔org, the account list) merged with /api/limits (the router's harvested
@@ -755,7 +645,7 @@ def fetch(host_key: str) -> dict:
         if isinstance(state, dict) else {}
     my_pin = pins.get(_consumer_name().lower(), "")
     # cross-machine presence: which boxes are on which account (from the MCP server)
-    pres = _mcp_get("/presence")
+    pres = _PRES   # refreshed by _live_worker; never blocks the UI thread
     machines_by = {a.get("name"): (a.get("machines") or [])
                    for a in (pres.get("accounts") or []) if isinstance(a, dict)}
     rows = []
@@ -993,41 +883,37 @@ def _menu(stdscr, title, items):
 # per-account menu, opened with ↵ on a highlighted account row (Accounts tab)
 _ACCOUNT_ITEMS = [
     ("switch to this account", "switch",
-     "Make this the account you use: sets BOTH the local Mac login and "
-     "claude.hostbun.cc. New claude/ccc windows launch as it; already-open windows "
-     "keep the old login until you restart them (Windows → restart all)."),
-    ("test account", "test",
-     "Fire a 1-token probe on this account and report ok / error. Cheap liveness "
-     "check, does not change anything."),
+     "Pin THIS box to this account in the router's server-side pin map "
+     "(/api/pins — merges one key, validates the name). Every pane routing "
+     "through llm.hostbun.cc bills to it LIVE; no restart needed."),
+    ("test account (live)", "test",
+     "Ask the router to ping this subscription once (1 token) and report the "
+     "fresh 5h/7d reading — or the exact refusal (429 spent window vs "
+     "✕ OAuth-disabled dead login)."),
     ("reveal token", "reveal",
-     "Show this account's long-lived login token in a popup (for copying into "
-     "another tool)."),
+     "Not possible: the router stores tokens server-side and never reveals them "
+     "(by design). Mint a fresh setup-token if you need one elsewhere."),
     ("rename account", "rename",
-     "Rename this account: re-imports its token under the new name, then deletes "
-     "the old entry. Keeps the ★ launch pointer if it was set."),
-    ("reset this account's usage count", "reset_usage_sel",
-     "Zero claude.hostbun.cc's LOCAL usage tally for this account. Bookkeeping only "
-     "— does NOT reset the real Anthropic limit."),
+     "Rename in the llm.hostbun.cc panel (Accounts tab) — the router owns the "
+     "pool; cccc pins, it doesn't own."),
     ("delete account", "delete",
-     "Remove this account from claude.hostbun.cc. Irreversible — you'd need the "
-     "setup-token to re-add it."),
+     "Remove this account from the router's pool (/api/accounts/remove). "
+     "Irreversible — you'd need a fresh setup-token to re-add it."),
 ]
 
 # Accounts tab — pool-wide actions, shown as rows BELOW the account list.
 # (Per-account stuff is in _ACCOUNT_ITEMS above, reached with ↵ on a row.)
 _POOL_ITEMS = [
     ("＋ add an account", "add",
-     "Import a new account by name + setup-token (sk-ant-oat…). Verified before "
-     "saving."),
+     "Add accounts in the llm.hostbun.cc panel (name + setup-token, sk-ant-oat…) — "
+     "the router owns the pool."),
     ("⟳ refresh now", "refresh",
-     "Re-fetch the table now: accounts + CACHED 5h/7d usage. Cheap cache — for the "
-     "real limits use LIVE limit check."),
+     "Re-fetch the table now: accounts + the router's harvested 5h/7d usage. Free "
+     "— for a guaranteed-fresh reading use LIVE limit check."),
     ("⚡ LIVE limit check", "live_probe",
-     "Read Anthropic's REAL 5h/7d limits for every account (one tiny message each). "
-     "The ground truth the cache understates — slower, costs a token per account."),
-    ("↺ reset ALL usage counts", "reset_usage_all",
-     "Zero the LOCAL usage tallies for ALL accounts. Bookkeeping only, not the real "
-     "limits."),
+     "POST /api/claudecode/limits {all:true}: the router pings every subscription "
+     "once (1 token each) for fresh rate-limit headers. Ground truth — catches "
+     "idle/refunded accounts whose harvested reading went stale."),
 ]
 
 # Windows tab — every action touches ALL your running claude/ccc windows at once.
@@ -1146,17 +1032,16 @@ def run(stdscr):
     def info(msg):
         STATUS["msg"], STATUS["kind"] = msg, "info"
 
-    host_key = HOST           # account dashboard is single-host; llm is the router, not a provider
     sel = 0                       # selected account row (Accounts tab)
     # paint a frame BEFORE the first (blocking) fetch — otherwise the curses
-    # alt-screen sits BLANK while the network call to claude.hostbun.cc is in
+    # alt-screen sits BLANK while the network call to the router is in
     # flight, which reads as "nothing happens" on a slow/unreachable gateway.
     _hh, _ww = stdscr.getmaxyx()
     put(0, 0, " claudectl ".ljust(_ww)[:_ww], C_HEADER)
-    put(2, 2, f"connecting to {host_key}.hostbun.cc …", C_CYAN)
+    put(2, 2, f"connecting to {LLM_ADMIN.split('://')[-1]} …", C_CYAN)
     busy("loading accounts from the router (llm.hostbun.cc)…")
     stdscr.refresh()
-    data = fetch(host_key)
+    data = fetch()
     stdscr.timeout(REFRESH_MS)   # getch() returns -1 after this idle -> auto-refresh
     import threading
     threading.Thread(target=_live_worker, daemon=True).start()   # LIVE 7d/usable in bg
@@ -1215,47 +1100,69 @@ def run(stdscr):
         nonlocal data
         if action == "switch" and cur:
             name = cur["name"]
-            # Pin THIS box to `name` in the router's server-side consumer→account LOCK
-            # map (llm.hostbun.cc). The router bills EVERY pane on this box to `name`
-            # LIVE — no restart — as long as the box ROUTES through the gateway
-            # (ANTHROPIC_BASE_URL=llm.hostbun.cc). Tokens live server-side now, so there
+            # Pin THIS box to `name` in the router's server-side pin map (/api/pins).
+            # The router bills EVERY pane on this box to `name` LIVE — no restart —
+            # as long as the box ROUTES through the gateway
+            # (ANTHROPIC_BASE_URL=llm.hostbun.cc). Tokens live server-side; there
             # is no keychain swap: gateway mode IS the switch.
-            busy(f"locking {name} on the router · all panes, live…")
+            busy(f"pinning {name} on the router · all panes, live…")
             gl = gateway_set_lock(name)
             if gl.get("ok"):
                 _write_local_selected(name)      # ★ tracks the pin
+                set_consumer_headers(name)       # keep X-Consumer/X-Project fresh
                 ok(f"now on {name}  ·  router ✓ live on every gateway pane — no restart")
             else:
-                err(f"lock FAILED: {gl.get('error','?')}  (is the box routing through "
+                err(f"pin FAILED: {gl.get('error','?')}  (is the box routing through "
                     f"the gateway? Setup tab → gateway on)")
-            data = fetch(host_key)
+            data = fetch()
         elif action == "test" and cur:
-            # No probe to send — the router already harvests each account's live
-            # 5h/7d status into /api/limits, which fetch() shows. Report that.
-            lv = _LIVE.get(cur["name"], {})
-            st = (lv.get("s7") or lv.get("s5") or ("usable" if lv.get("usable") else "?"))
-            (ok if lv.get("usable", True) else err)(
-                f"{cur['name']}: router status {st} · 5h {lv.get('u5', '?')}% / 7d {lv.get('u7', '?')}% used")
-        elif action in ("reveal", "rename", "delete", "add"):
-            # Account lifecycle is server-side now: the router holds the tokens
-            # (never revealed) and the pool is edited in the llm.hostbun.cc panel.
-            info("router-managed pool — add / rename / remove accounts (and their "
-                 "tokens) in the llm.hostbun.cc panel; cccc pins, it doesn't own them")
-        elif action == "live_probe":
-            busy(f"probing REAL 5h/7d limits · 1 msg per account ({len(data['rows'])})…")
-            try:
+            # THE live read: the router pings this one subscription (1 token) and
+            # returns a fresh reading — or the reason it can't (429 vs OAuth dead).
+            name = cur["name"]
+            busy(f"live-testing {name} via the router (1 token)…")
+            r = _llm_post("claudecode/limits", {"account": name}, timeout=45)
+            rd = r.get("reading") if isinstance(r, dict) else None
+            if rd:
+                ok(f"{name}: 5h {round((rd.get('u5') or 0) * 100)}% / "
+                   f"7d {round((rd.get('u7') or 0) * 100)}% used · live ✓")
                 _live_refresh()
-                ok("live limits refreshed · table now shows ground truth")
-            except Exception as e:  # noqa: BLE001
-                err(f"live probe failed: {e}")
+            else:
+                why = (r.get("reason") or r.get("error") or "no reading") if isinstance(r, dict) else "no reading"
+                err(f"{name}: {why}")
+        elif action in ("reveal", "rename", "add"):
+            # Tokens are server-side and never revealed; pool naming/creation is
+            # edited in the llm.hostbun.cc panel.
+            info("router-managed pool — add / rename accounts (and their tokens) "
+                 "in the llm.hostbun.cc panel; cccc pins, it doesn't own them")
+        elif action == "delete" and cur:
+            name = cur["name"]
+            if not _confirm(stdscr, f"delete account '{name}' from the router pool? "
+                                    f"IRREVERSIBLE — needs a fresh setup-token to re-add"):
+                info("delete cancelled")
+            else:
+                busy(f"removing {name} from the pool…")
+                r = _llm_post("accounts/remove", {"account": name})
+                if isinstance(r, dict) and r.get("ok"):
+                    ok(f"{name} removed from the pool")
+                else:
+                    err(f"remove failed: {(r or {}).get('error', '?')}")
+                data = fetch()
+            stdscr.timeout(REFRESH_MS)
+        elif action == "live_probe":
+            busy(f"live limit check · router pings every subscription (1 token × {len(data['rows'])})…")
+            r = _llm_post("claudecode/limits", {"all": True}, timeout=120)
+            accts = (r or {}).get("accounts") if isinstance(r, dict) else None
+            if accts is not None:
+                got = sum(1 for a in accts if isinstance(a, dict) and a.get("reading"))
+                _live_refresh()
+                data = fetch()
+                ok(f"live limits refreshed · fresh reading on {got}/{len(accts)} accounts")
+            else:
+                err(f"live probe failed: {(r or {}).get('error', '?')}")
         elif action == "refresh":
-            busy("refreshing accounts from gateway…")
-            data = fetch(host_key)
+            busy("refreshing accounts from the router…")
+            data = fetch()
             ok(f"refreshed · {len(data['rows'])} accounts")
-        elif action in ("reset_usage_sel", "reset_usage_all"):
-            # The old local usage tally lived in the claudebox wrapper; the router
-            # tracks real Anthropic 5h/7d headroom (/api/limits) with nothing to zero.
-            info("no local tally to reset — the router shows real Anthropic 5h/7d headroom")
         elif action == "doctor":
             busy("running doctor…")
             _run_external(stdscr, ["python3", _DOCTOR_SCRIPT])
@@ -1351,7 +1258,7 @@ def run(stdscr):
                 put(h - 3, 2, dl[:w - 3], C_CYAN)
 
         # ---- title + tab bar (rows 0-1) --------------------------------------
-        host_str = HOSTS[host_key].split('://')[-1]
+        host_str = LLM_ADMIN.split('://')[-1]
         age = (f"live {int(time.time() - _LIVE_AT)}s ago" if _LIVE_AT else "probing…")
         dot = ("● " if _LIVE else "◌ ") + age
         # full-width brand bar: name left, host middle-dim, live-dot right
@@ -1513,7 +1420,7 @@ def run(stdscr):
 
         ch = stdscr.getch()
         if ch == -1:            # idle timeout -> auto-refetch latest from the gateway
-            data = fetch(host_key)
+            data = fetch()
             continue
         if ch in (ord("q"), 27):
             return
@@ -1681,7 +1588,14 @@ def main():
     if argv and argv[0] == "guard":
         return _guard(quiet="--quiet" in argv, fix="--fix" in argv)
     if argv and argv[0] in _SUBCMDS:
-        os.execvp("python3", ["python3", _SUBCMDS[argv[0]], *argv[1:]])
+        script = _SUBCMDS[argv[0]]
+        if not os.path.exists(script):
+            # `dock`/`links` live in the devdashco/claudectl repo (the cmuxdock
+            # plugin) since the cccc/ move — this checkout doesn't ship them.
+            sys.stderr.write(f"cccc: `{argv[0]}` is not in this checkout — the cmux Dock "
+                             f"moved to the devdashco/claudectl repo (cmuxdock plugin).\n")
+            return 2
+        os.execvp("python3", ["python3", script, *argv[1:]])
     if argv and argv[0] in ("-h", "--help"):
         print("cccc — claudectl dashboard (single command; all actions inside)\n\n"
               "  cccc                       open the TUI (pin an account, watch limits)\n"
@@ -1689,7 +1603,6 @@ def main():
               "  cccc refresh [--go]        restart running ccc panes onto the current code\n"
               "  cccc doctor                LSP / environment health check\n"
               "  cccc guard [--fix]         verify subscription-only (no billed API-token path)\n"
-              "  cccc dock  [--add|--list]  the cmux project Dock panel (links, board, actions)\n"
               "  cccc panes [--list]        pick a cmux pane and respawn it (restart an MCP / resume claude)\n")
         return
     try:

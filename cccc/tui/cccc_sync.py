@@ -7,10 +7,10 @@ track the shared version, then re-runs install.sh idempotently to re-vendor the
 statusline registration and symlinks.
 
 Two modes, decided per checkout:
-- DEV clone (pmac's ~/Documents/GitHub/claudectl): conservative. Skips the pull
-  while the tree is dirty, and refuses to reset — never clobbers local work.
+- DEV clone (pmac's ~/Documents/GitHub/llm-hostbun-router): conservative. Skips the
+  pull while the tree is dirty, and refuses to reset — never clobbers local work.
 - DEPLOY clone (marked with a `.cccc-deploy` file or CLAUDECTL_DEPLOY=1, e.g.
-  wmac / pbox's ~/.claudectl): always converges to the upstream and can NEVER get
+  wmac / pbox's ~/.llm-hostbun-router): always converges to the upstream and can NEVER get
   wedged — fast-forwards when it can, hard-resets to the upstream when history
   has diverged (stray local commit, origin force-push).
 - Never touches PATH (NO_MODIFY_PATH=1) and never restarts panes unless asked.
@@ -156,7 +156,7 @@ def main() -> int:
     deploy = (os.environ.get("CLAUDECTL_DEPLOY") == "1"
               or os.path.exists(os.path.join(REPO, ".cccc-deploy")))
     upstream = (git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}").stdout.strip()
-                or "origin/main")
+                or "origin/master")
     git("fetch", "--quiet", upstream.split("/")[0])          # learn the remote tip
     remote = git("rev-parse", "--short", upstream).stdout.strip()
     dirty = git("status", "--porcelain", "-uno").stdout.strip()
@@ -181,7 +181,7 @@ def main() -> int:
         log(f"updated {before} -> {after}", a.quiet)
         # re-run install.sh so any new files / statusline registration land.
         env = {**os.environ, "NO_MODIFY_PATH": "1"}
-        inst = subprocess.run(["sh", os.path.join(REPO, "install.sh")],
+        inst = subprocess.run(["sh", os.path.join(REPO, "cccc", "install.sh")],
                               capture_output=True, text=True, env=env)
         log("install.sh refreshed" if inst.returncode == 0
             else f"install.sh warn: {inst.stderr.strip()[:200]}", a.quiet)
@@ -200,7 +200,7 @@ def main() -> int:
         plugin_autoupdate(a.quiet)
 
     if a.restart:
-        refresh_py = os.path.join(REPO, "plugins", "claudectl", "mcp", "ccc_refresh.py")
+        refresh_py = os.path.join(REPO, "cccc", "plugins", "claudectl", "mcp", "ccc_refresh.py")
         subprocess.run(["python3", refresh_py, "--go"], capture_output=True, text=True)
         log("refresh --go: panes relaunched on current code", a.quiet)
 
