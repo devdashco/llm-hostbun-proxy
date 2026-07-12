@@ -104,7 +104,10 @@ async function projectUsage(project, windowMs) {
 }
 // Decide what to do for this project right now. null = no limit configured.
 // action ∈ ok | warn | slow | block. pct = max(token%, call%) of the cap.
+// Usage limits are a PROJECT (app) control only — a developer at a keyboard is never quota-throttled
+// or blocked. A dev consumer short-circuits to null before any cap is consulted.
 async function usageVerdict(project) {
+  if (_isDev(_consumerOf(project))) return null;
   const lim = limitFor(project);
   if (!lim) return null;
   const u = await projectUsage(project, WINDOW_MS[lim.window] || WINDOW_MS["24h"]);
