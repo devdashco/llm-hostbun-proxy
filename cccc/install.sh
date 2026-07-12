@@ -212,6 +212,85 @@ case ":$PATH:" in
     ;;
 esac
 
+# --- 3b. VERIFY — never report success on a broken install ------------------
+# Every claim above is re-checked from the OUTSIDE: what kind of claude install
+# this box has, that settings.json really points at THIS checkout's statusline,
+# and that the statusline actually executes. A failed check fails the installer
+# (nonzero exit), which `cccc sync` logs loudly instead of "install.sh refreshed".
+say ""
+say "verifying install…"
+CLAUDECTL_DIR="$DIR" python3 - "$HOME/.claude/settings.json" <<'PY'
+import json, os, subprocess, sys
+path, DIR = sys.argv[1], os.environ["CLAUDECTL_DIR"]
+fails, notes = [], []
+
+# what kind of claude installation is this box running? (report before touching)
+claude = subprocess.run(["sh", "-c", "command -v claude"], capture_output=True, text=True).stdout.strip()
+ver = ""
+if claude:
+    ver = subprocess.run([claude, "--version"], capture_output=True, text=True, timeout=20).stdout.strip()[:40]
+kind = "none"
+if claude:
+    kind = "native" if ".local" in claude or "/usr/local" in claude else "npm/other"
+    if "/plugins/" in os.path.realpath(claude):
+        kind = "plugin-shim"
+login = "keychain (macOS)" if sys.platform == "darwin" else (
+    "~/.claude/.credentials.json" if os.path.exists(os.path.expanduser("~/.claude/.credentials.json")) else "none found")
+notes.append(f"claude install: {kind}" + (f" · {ver}" if ver else " · NOT ON PATH") + f" · login: {login}")
+notes.append(f"settings file:  {path}")
+
+# settings.json must parse — a half-written file bricks every claude launch
+try:
+    cfg = json.load(open(path))
+except FileNotFoundError:
+    cfg, _ = {}, fails.append(f"{path} does not exist — nothing was registered")
+except json.JSONDecodeError as e:
+    cfg, _ = {}, fails.append(f"{path} is INVALID JSON ({e}) — claude will ignore all of it")
+
+# statusline: must be OURS and must point at THIS checkout (a stale path from a
+# previous clone renders an old line forever and looks exactly like 'installed')
+want = f"{DIR}/statusline/cccc-statusline.py"
+sl = (cfg.get("statusLine") or {}).get("command", "")
+if os.environ.get("CLAUDECTL_NO_STATUSLINE") == "1":
+    notes.append("statusline:     skipped (CLAUDECTL_NO_STATUSLINE=1)")
+elif "cccc-statusline.py" not in sl and "statusline-ratelimits.sh" not in sl and sl:
+    notes.append(f"statusline:     foreign, deliberately kept ({sl[:60]!r})")
+elif want not in sl:
+    fails.append(f"statusLine points at {sl or '(nothing)'!r}, expected {want!r} — stale checkout path?")
+else:
+    # it must also RUN: registration that crashes on stdin is a blank line in every pane
+    r = subprocess.run(["python3", want], input='{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"v"}}',
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0 or not r.stdout.strip():
+        fails.append(f"statusline registered but does not execute: rc={r.returncode} {r.stderr.strip()[:120]!r}")
+    else:
+        notes.append("statusline:     ✓ registered to this checkout and renders")
+
+# fast-mode lock really landed
+if ((cfg.get("env") or {}).get("CLAUDE_CODE_DISABLE_FAST_MODE")) != "1":
+    fails.append("env.CLAUDE_CODE_DISABLE_FAST_MODE is not '1' — fast-mode lock did not land")
+
+# wrappers resolve on a fresh shell's PATH
+w = subprocess.run(["sh", "-lc", "command -v cccc"], capture_output=True, text=True).stdout.strip()
+if not w:
+    fails.append("`cccc` not on PATH in a login shell — wrapper or PATH line missing")
+else:
+    notes.append(f"cccc on PATH:   ✓ {w}")
+
+for n in notes:
+    print(f"  {n}")
+for f in fails:
+    print(f"  ✗ {f}", file=sys.stderr)
+sys.exit(1 if fails else 0)
+PY
+VERIFY_RC=$?
+if [ "$VERIFY_RC" != "0" ]; then
+  say ""
+  say "✗ INSTALL VERIFICATION FAILED — the checks above name what is wrong. Fix and re-run."
+  exit 1
+fi
+say "✓ verified"
+
 # --- 4. done ---------------------------------------------------------------
 say ""
 say "run:     cccc"

@@ -179,14 +179,21 @@ def main() -> int:
     after = git("rev-parse", "--short", "HEAD").stdout.strip()
     if after != before:
         log(f"updated {before} -> {after}", a.quiet)
-        # re-run install.sh so any new files / statusline registration land.
-        env = {**os.environ, "NO_MODIFY_PATH": "1"}
-        inst = subprocess.run(["sh", os.path.join(REPO, "cccc", "install.sh")],
-                              capture_output=True, text=True, env=env)
-        log("install.sh refreshed" if inst.returncode == 0
-            else f"install.sh warn: {inst.stderr.strip()[:200]}", a.quiet)
     elif deploy or not dirty:
         log(f"up to date at {after}", a.quiet)
+    # ALWAYS re-run install.sh — statusline registration, wrappers and the fast-mode
+    # lock must converge on every sync, not only when the sha moved (a hand-edited
+    # settings.json or stale statusline path is otherwise never healed). install.sh
+    # VERIFIES itself (settings points at this checkout, statusline executes) and
+    # exits nonzero on any failed check — surfaced loudly here, never swallowed.
+    env = {**os.environ, "NO_MODIFY_PATH": "1"}
+    inst = subprocess.run(["sh", os.path.join(REPO, "cccc", "install.sh")],
+                          capture_output=True, text=True, env=env)
+    if inst.returncode == 0:
+        log("install.sh refreshed + verified ✓", a.quiet)
+    else:
+        detail = (inst.stderr.strip() or inst.stdout.strip())[-300:]
+        log(f"install.sh FAILED VERIFICATION: {detail}", a.quiet)
 
     # bust the statusline version cache so the new sha shows immediately.
     try:

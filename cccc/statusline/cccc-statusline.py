@@ -163,6 +163,18 @@ def _gauge_seg(label: str, rem: float, epoch=None) -> str:
     return f"{body}{_DIM}↻{r}{_RST}" if r else body
 
 
+def _box_free():
+    """% of this MACHINE's CPU capacity still free — 1-min loadavg against core count,
+    same LEFT convention as every other gauge (green = idle box, red = saturated; can
+    exceed-load → 0). os.getloadavg is a syscall on mac+linux: no subprocess, render-safe."""
+    try:
+        load1 = os.getloadavg()[0]
+        cores = os.cpu_count() or 1
+    except OSError:
+        return None
+    return max(0.0, min(100.0, 100.0 - load1 / cores * 100.0))
+
+
 def _ctx_free(d: dict):
     """% of the context window still FREE — 100 (green) on a fresh session, falling
     as the conversation grows. Computed ourselves from token occupancy, NOT read from
@@ -841,6 +853,9 @@ def main() -> int:
         line1.append(seg)
     if ctx_free is not None:
         line1.append(_gauge_seg("ctxfree", ctx_free))   # % context FREE: 100 green → 0 red
+    box = _box_free()
+    if box is not None:
+        line1.append(_gauge_seg("box", box))            # % machine capacity FREE (loadavg vs cores)
     lsp = _lsp_seg(cwd)
     if lsp:
         line1.append(lsp)
