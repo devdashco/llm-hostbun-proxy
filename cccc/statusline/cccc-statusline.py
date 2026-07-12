@@ -23,6 +23,13 @@ identical to your own keychain pin):
     🌐host·gateway              some other base URL
     🔑key·BILLED                pay-per-token API key (not a subscription)
 
+The account NAME is coloured by its hottest window (worst of 5h/7d LEFT): green =
+≥50% left, yellow = 20–49% left, red = <20% left, uncoloured = no reading. Staleness
+is never silent: red `⌛stale` = the background refresh itself has failed for 10+ min
+(numbers frozen; colour dropped), dim `⌛3h old` = refresh works but the harvested
+reading is old because the account has served no traffic (idle accounts keep their
+last reading — the router only learns from real responses).
+
 Reads Claude Code's status JSON on stdin. Any segment whose data is absent this turn
 is simply omitted — nothing is fabricated (e.g. rate-limit segments only appear once
 the session has had one API response).
@@ -67,7 +74,7 @@ _MACHINE_FILE = f"{HOME}/.claude-accounts/.cccc-machine"   # this box's fleet na
 # statusline renders — so you always see WHO is serving and how hot they are.
 _LLM_ADMIN = os.environ.get("CCTL_LLM_ADMIN", "https://llm.hostbun.cc").rstrip("/")
 _LLM_PW = os.environ.get("CCTL_LLM_PW", "ddash")
-_POOL_CACHE = f"{HOME}/.claude/.cctl-anthropic"    # epoch\tname\tu5\tu7\tstatus\torg\tsource
+_POOL_CACHE = f"{HOME}/.claude/.cctl-anthropic"    # epoch\tname\tu5\tu7\tstatus\torg\tsource\treading_ts(ms)
 _POOL_TTL = 40                                     # cache freshness before a background refresh
 # --- failed-MCP segment ----------------------------------------------------
 # `claude mcp list` health-checks every configured server (~10s — WAY too slow for
@@ -470,7 +477,7 @@ def _account():
             # pass asks the gateway what this consumer resolves to and caches it. That's the
             # account that actually gets billed. source="auto" = this box is UNMAPPED and
             # riding the shared sticky (rotates) — flagged loudly so it's obvious it's unlocked.
-            name, _u5, _u7, _st, _fr, org, source = _pool_read()
+            name, _u5, _u7, _st, _fr, org, source, _ages = _pool_read()
             if not name:
                 return ("📡", "auto?", _route_tag("llm.hostbun.cc"))
             note = f"{_DIM}·{org[:4]}{_RST}" if org else ""
@@ -613,13 +620,39 @@ def _anthropic_refresh() -> None:
     UNMAPPED do we fall back to the global sticky (source='auto', flagged in the render).
     Also grabs that account's harvested 5h/7d. Admin-gated, fail-silent — never blocks."""
     try:
+        import urllib.error
         import urllib.request
         import http.cookiejar
-        op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
-        op.open(urllib.request.Request(f"{_LLM_ADMIN}/api/login",
-                data=json.dumps({"password": _LLM_PW}).encode(),
-                headers={"content-type": "application/json"}), timeout=8).read()
-        st = json.load(op.open(f"{_LLM_ADMIN}/api/state", timeout=8))
+        # Reuse the fleet-shared admin cookie (same file as the cccc TUI) and log in ONLY
+        # on 401/403. A fresh login per refresh trips the router's per-IP login throttle
+        # (>10/5min, fleet shares one egress) → every refresh 429s → the cache silently
+        # goes stale and the statusline shows hours-old numbers as if current.
+        cookie_file = f"{HOME}/.claude/.cctl-admin-cookie"
+        cj = http.cookiejar.MozillaCookieJar(cookie_file)
+        try:
+            cj.load(ignore_discard=True, ignore_expires=True)
+        except (OSError, http.cookiejar.LoadError):
+            pass
+        op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+
+        def _login():
+            op.open(urllib.request.Request(f"{_LLM_ADMIN}/api/login",
+                    data=json.dumps({"password": _LLM_PW}).encode(),
+                    headers={"content-type": "application/json"}), timeout=8).read()
+            try:
+                os.makedirs(os.path.dirname(cookie_file), exist_ok=True)
+                cj.save(ignore_discard=True, ignore_expires=True)
+                os.chmod(cookie_file, 0o600)
+            except OSError:
+                pass
+
+        try:
+            st = json.load(op.open(f"{_LLM_ADMIN}/api/state", timeout=8))
+        except urllib.error.HTTPError as e:
+            if e.code not in (401, 403):
+                raise
+            _login()
+            st = json.load(op.open(f"{_LLM_ADMIN}/api/state", timeout=8))
         pool = st.get("claudecodeAccountPool") or []
         # projectAccounts is the current name; consumerAccounts the pre-rename alias.
         pinmap = st.get("projectAccounts") or st.get("consumerAccounts") or {}
@@ -634,7 +667,7 @@ def _anthropic_refresh() -> None:
             org = next((a.get("org", "") for a in pool
                         if str(a.get("name", "")).lower() == str(name).lower()), "")
             source = "auto"
-        u5 = u7 = status = ""
+        u5 = u7 = status = hts = ""
         if name and org:
             try:
                 for r in json.load(op.open(f"{_LLM_ADMIN}/api/limits", timeout=8)).get("rows", []):
@@ -642,11 +675,12 @@ def _anthropic_refresh() -> None:
                         u5 = "" if r.get("u5") is None else str(round(r["u5"] * 100))
                         u7 = "" if r.get("u7") is None else str(round(r["u7"] * 100))
                         status = r.get("status") or ""
+                        hts = str(r.get("ts") or "")   # when Anthropic last SAID this — ages the reading
                         break
             except Exception:  # noqa: BLE001
                 pass
         with open(_POOL_CACHE, "w") as f:
-            f.write(f"{int(time.time())}\t{name}\t{u5}\t{u7}\t{status}\t{org}\t{source}")
+            f.write(f"{int(time.time())}\t{name}\t{u5}\t{u7}\t{status}\t{org}\t{source}\t{hts}")
     except Exception:  # noqa: BLE001
         pass
 
@@ -658,16 +692,22 @@ def _pool_read():
     when unknown. Shared by _account() and _anthropic_seg()."""
     name = u5 = u7 = status = org = source = ""
     fresh = False
+    cache_ts = rd_ts = 0.0
     try:
         with open(_POOL_CACHE) as f:
             p = f.read().split("\t")
-        fresh = (time.time() - float(p[0])) < _POOL_TTL
+        cache_ts = float(p[0])
+        fresh = (time.time() - cache_ts) < _POOL_TTL
         name = p[1] if len(p) > 1 else ""
         u5 = p[2] if len(p) > 2 else ""
         u7 = p[3] if len(p) > 3 else ""
         status = p[4].strip() if len(p) > 4 else ""
         org = p[5].strip() if len(p) > 5 else ""
         source = p[6].strip() if len(p) > 6 else ""
+        try:
+            rd_ts = float(p[7]) / 1000.0 if len(p) > 7 and p[7].strip() else 0.0
+        except ValueError:
+            rd_ts = 0.0
     except Exception:  # noqa: BLE001
         pass
     if not fresh:                       # kick a non-blocking refresh for next time
@@ -676,7 +716,7 @@ def _pool_read():
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:  # noqa: BLE001
             pass
-    return name, u5, u7, status, fresh, org, source
+    return name, u5, u7, status, fresh, org, source, (cache_ts, rd_ts)
 
 
 def _anthropic_seg() -> str:
@@ -686,7 +726,7 @@ def _anthropic_seg() -> str:
     USED% off the rate-limit headers; we flip it to LEFT so high is always good.)"""
     if "llm.hostbun.cc" not in os.environ.get("ANTHROPIC_BASE_URL", ""):
         return ""
-    name, u5, u7, _st, _fr, _org, _src = _pool_read()
+    name, u5, u7, _st, _fr, _org, _src, _ages = _pool_read()
     if not name:
         return ""
     # 100 - used = LEFT; render with the shared green→red gauge (high = good).
@@ -818,9 +858,22 @@ def main() -> int:
                                (rl.get("seven_day") or {}).get("used_percentage")) if p is not None]
     tail = ""
     if not limit_segs:                               # Claude didn't surface limits →
-        pn, pu5, pu7, _st, _fr, _org, _src = _pool_read()  # colour + headroom from the proxy harvest
+        pn, pu5, pu7, _st, _fr, _org, _src, pages = _pool_read()  # colour + headroom from the proxy harvest
         frees += [100 - int(u) for u in (pu5, pu7) if u != ""]
         tail = _anthropic_seg()
+        now = time.time()
+        cache_ts, rd_ts = pages
+        if cache_ts and now - cache_ts > 600:
+            # the background refresh has been FAILING for 10+ min — the numbers on
+            # screen are frozen. Say so, and drop the health colour: a confident
+            # green over dead data is worse than no colour.
+            frees = []
+            tail += f" {_RED}⌛stale{_RST}"
+        elif rd_ts and now - rd_ts > 7200:
+            # refresh works, but Anthropic hasn't SAID anything about this account in
+            # 2h+ (idle account — the harvest only learns from served traffic). The
+            # reading is real but old; age it instead of pretending it's current.
+            tail += f" {_DIM}⌛{_rel(now + (now - rd_ts)) or '?'} old{_RST}"
     acol = _health(min(frees)) if frees else ""      # name colour = worst window; plain if unknown
     acct = f"{icon}{acol}{_BLD}{aname}{_RST}{anote}"
     line2 = [" ".join([acct] + limit_segs)]
