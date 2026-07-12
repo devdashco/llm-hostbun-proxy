@@ -74,7 +74,7 @@ function Routing(){
   const [known,setKnown]=useState([]);
   const [resolveOut,setResolveOut]=useState(null);
   const [resIn,setResIn]=useState(''); const [resProj,setResProj]=useState('');
-  const [na,setNa]=useState({alias:'',target:''}), [nr,setNr]=useState({in:'',provider:'claudecode',model:''}), [ng,setNg]=useState({name:'',prefix:''}), [nl,setNl]=useState('');
+  const [na,setNa]=useState({alias:'',target:''}), [nr,setNr]=useState({in:'',provider:'claudecode',model:''}), [nl,setNl]=useState('');
   useEffect(()=>{ setD(seed(state)); },[state]);
   useEffect(()=>{ (async()=>{ try{ const s=await api('stats?window=all'); setKnown((s.byProject||[]).map(r=>r.project).filter(Boolean)); }catch(e){} })(); },[]);
   function seed(s){ return { bases:clone(s.bases), claudePrefix:s.claudePrefix, jsonEnforce:!!s.jsonEnforce, jsonMaxRetries:s.jsonMaxRetries,

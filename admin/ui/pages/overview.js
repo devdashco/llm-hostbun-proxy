@@ -85,7 +85,7 @@ function Overview(){
     </table></div>
   </${Card}>
   <details class="adv" open=${cfgOpen}><summary onClick=${e=>{e.preventDefault();setCfgOpen(!cfgOpen);}}>Effective config (raw JSON)</summary>
-    ${cfgOpen&&html`<pre style="margin-top:0">${JSON.stringify({forceModel:state.forceModel,modelRoutes:state.modelRoutes,projectRoutes:state.projectRoutes,projectGroups:state.projectGroups,cloudPolicy:state.cloudPolicy,cloudAllowlist:state.cloudAllowlist,defaultRoute:state.defaultRoute,localMap:state.localMap,gatedModels:state.gatedModels,bases:state.bases,jsonEnforce:state.jsonEnforce,configPersisted:state.configPersisted},null,2)}</pre>`}
+    ${cfgOpen&&html`<pre style="margin-top:0">${JSON.stringify({forceModel:state.forceModel,modelRoutes:state.modelRoutes,projectRoutes:state.projectRoutes,cloudPolicy:state.cloudPolicy,cloudAllowlist:state.cloudAllowlist,defaultRoute:state.defaultRoute,localMap:state.localMap,gatedModels:state.gatedModels,bases:state.bases,jsonEnforce:state.jsonEnforce,configPersisted:state.configPersisted},null,2)}</pre>`}
   </details>`;
 }
 /* The claudecode pool, condensed: each subscription, its usage-window headroom, and who spends it.

@@ -15,11 +15,24 @@ REPO="$(pwd)"
 LOG="${LLM_ARCHIVE_LOG:-$HOME/.llm-archive/archive.log}"
 mkdir -p "$(dirname "$LOG")"
 
+# node on PATH? The Coolify scriptbox-pbox runner container has bash+git but NOT node — however it
+# bind-mounts the host home, so the host's nvm node is visible. Prefer a v22, fall back to any.
+if ! command -v node >/dev/null 2>&1; then
+  for d in "$HOME"/.nvm/versions/node/v22.*/bin "$HOME"/.nvm/versions/node/v*/bin; do
+    [ -x "$d/node" ] && { PATH="$d:$PATH"; break; }
+  done
+  export PATH
+fi
+
 # Single-instance: an incremental run can outlast the hourly tick (a big catch-up), and two writers
 # racing on the bucket cursor could rewind it. flock makes an overlapping cron fire a no-op.
 LOCK="$HOME/.llm-archive/run.lock"
 exec 9>"$LOCK"
 if ! flock -n 9; then echo "$(date -u +%FT%TZ) another run holds the lock; skipping" >>"$LOG"; exit 0; fi
+
+# Best-effort self-update to origin/master (fast-forward only — never clobbers a dirty tree). Keeps
+# the scheduled job current without a separate deploy step; a failure just runs the checked-out code.
+git -C "$REPO" pull --ff-only --quiet 2>/dev/null || true
 
 # ── load config ──────────────────────────────────────────────────────────────
 # Try keyvault first (JSON at llm-archive/config → export each key). Falls back to the env file.

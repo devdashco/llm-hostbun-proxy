@@ -72,8 +72,8 @@ function enforceAllow(r, m, rule, label) {
 
 // ── per-project usage limits ────────────────────────────────────────────────
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-// Resolve the effective limit for a project: exact entry (authoritative) → matching
-// group's .limit → projectLimitDefault (only when it actually caps something). null = no limit.
+// Resolve the effective limit for a project: exact entry (authoritative) →
+// projectLimitDefault (only when it actually caps something). null = no limit.
 function limitFor(project) {
   if (!project) return null;
   const k = String(project).trim().toLowerCase();
@@ -82,8 +82,6 @@ function limitFor(project) {
     const e = pl[k];
     return (e && (e.tokens > 0 || e.calls > 0)) ? e : null; // explicit all-zero entry = exempt
   }
-  const g = matchProjectGroup(k);
-  if (g && g.limit && (g.limit.tokens > 0 || g.limit.calls > 0)) return g.limit;
   const d = CFG.projectLimitDefault;
   if (d && (d.tokens > 0 || d.calls > 0)) return d;
   return null;
@@ -121,8 +119,7 @@ async function usageVerdict(project) {
 }
 
 // Resolve a model name into a concrete upstream route. Priority:
-//   0a. projectRoutes (exact per-project override — beats everything, incl. group rules)
-//   0b. projectGroups (prefix-matched group override)
+//   0a. projectRoutes (exact per-project override, then per-consumer — beats everything)
 //   1. forceModel (global override)  2. modelRoutes (per-model, any provider)  3. local alias map
 
 // ── account selection: PINNED per project, never automatic ────────────────

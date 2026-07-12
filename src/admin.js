@@ -92,7 +92,6 @@ function adminState() {
     // now (null when off or no usable weekly reading — then pins decide, exactly as before).
     accountStrategy: CFG.accountStrategy || "pinned",
     autoAccount: CFG.accountStrategy === "soonest-weekly-reset" ? ((autoAccount() || {}).name || null) : null,
-    projectGroups: CFG.projectGroups,
     projectLimits: CFG.projectLimits,
     projectLimitDefault: CFG.projectLimitDefault,
     cloudPolicy: CFG.cloudPolicy,
@@ -239,7 +238,6 @@ async function handleAdminApi(req, res, path, prefix = "/api/") {
     if (patch.projectAccounts) next.projectAccounts = patch.projectAccounts;   // project → account PIN
     if (patch.consumerAccounts) next.consumerAccounts = patch.consumerAccounts;  // legacy name for the same
     if (typeof patch.defaultAccount === "string") next.defaultAccount = patch.defaultAccount;
-    if (patch.projectGroups) next.projectGroups = patch.projectGroups;
     if (Array.isArray(patch.claudecodeAccountPool)) next.claudecodeAccountPool = patch.claudecodeAccountPool;
     else if (Array.isArray(patch.anthropicPool)) next.claudecodeAccountPool = patch.anthropicPool;   // legacy name
     if (patch.projectLimits) next.projectLimits = patch.projectLimits;
