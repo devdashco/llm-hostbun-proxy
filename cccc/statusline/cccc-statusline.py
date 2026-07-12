@@ -312,7 +312,9 @@ def _git(cwd: str):
 
 
 def _model(name: str) -> str:
-    for tag in ("Opus", "Sonnet", "Haiku"):
+    # Claude 5 family (Fable/Mythos) + the 4.x line. Without Fable/Mythos here a pane running
+    # Claude Fable 5 rendered the raw "Claude Fable 5" instead of a clean "fable" tag.
+    for tag in ("Opus", "Sonnet", "Haiku", "Fable", "Mythos"):
         if tag in (name or ""):
             return tag.lower()
     return name or ""
