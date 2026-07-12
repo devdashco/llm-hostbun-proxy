@@ -13,7 +13,9 @@
     "test:docs": "node test/docs.test.mjs",
     "test:wire": "node test/wire.test.mjs",
     "test:imports": "node test/imports.test.mjs",
-    "dev": "PORT=${PORT:-8787} CONFIG_FILE=${CONFIG_FILE:-./.local/config.json} ADMIN_FILE=./admin/index.html DOCS_FILE=./docs/index.html PRICES_FILE=${PRICES_FILE:-./.local/prices.json} SESSION_INSECURE=1 node server.js",
+    "test:panel": "node test/panel-secrets.test.mjs",
+    "build:panel": "cd panel && npm ci && npm run build",
+    "dev": "PORT=${PORT:-8787} CONFIG_FILE=${CONFIG_FILE:-./.local/config.json} DOCS_FILE=./docs/index.html PANEL_DIR=${PANEL_DIR:-$PWD/panel/out} PRICES_FILE=${PRICES_FILE:-./.local/prices.json} SESSION_INSECURE=1 node server.js",
     "dev:prod": "bash scripts/dev-prod.sh"
   },
   "dependencies": {

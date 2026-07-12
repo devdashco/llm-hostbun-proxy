@@ -1,0 +1,8 @@
+# Keep the build context small + never copy host-built artifacts into the image.
+node_modules
+panel/node_modules
+panel/.next
+panel/out
+.local
+.git
+**/*.log

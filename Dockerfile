@@ -1,3 +1,14 @@
+# ── Stage 1: build the Next.js panel as a static export ──────────────────────
+# Dev deps are allowed here; the output is just files (panel/out). None of Next's runtime reaches
+# the final image — the router serves the export as plain static files.
+FROM node:24-alpine AS panel
+WORKDIR /panel
+COPY panel/package.json panel/package-lock.json ./
+RUN npm ci
+COPY panel/ ./
+RUN npm run build
+
+# ── Stage 2: the pg-only router ──────────────────────────────────────────────
 FROM node:24-alpine
 RUN apk add --no-cache curl jq
 WORKDIR /app
@@ -11,7 +22,11 @@ COPY translate.js /app/translate.js
 # new require'd file crash-looped the container on boot.
 COPY src /app/src
 COPY docs /srv/docs
+# admin/ is kept as an unused fallback until the Next panel is verified in prod (then deleted).
 COPY admin /srv/admin
+# The built Next export → /srv/panel, which server.js serves (PANEL_DIR). ADD A COPY like this for
+# any new required path, or the container is missing it at runtime.
+COPY --from=panel /panel/out /srv/panel
 COPY gen-prices.sh /usr/local/bin/gen-prices.sh
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/gen-prices.sh /usr/local/bin/entrypoint.sh && mkdir -p /srv

@@ -10,7 +10,7 @@
 // It was written as an old-vs-new parity harness during the src/ split (32 checks, 0 differences)
 // and kept as a regression suite: every expectation below was a real bug or a load-bearing rule.
 import { spawn, execFileSync } from "node:child_process";
-import { copyFileSync, mkdtempSync } from "node:fs";
+import { copyFileSync, mkdtempSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,7 +41,7 @@ const server = spawn("node", [join(ROOT, "server.js")], {
   // 127.0.0.1 instead of reaching api.anthropic.com — this suite makes no network calls, and a test
   // that quietly did would spend real tokens on someone's Max plan.
   env: { ...process.env, PORT: String(PORT), CONFIG_FILE: CFG, ADMIN_PASSWORD: "ddash",
-         SESSION_INSECURE: "1", ADMIN_FILE: join(ROOT, "admin/index.html"), DATABASE_URL: "",
+         SESSION_INSECURE: "1", PANEL_DIR: join(ROOT, "panel/out"), DATABASE_URL: "",
          ANTHROPIC_BASE: "http://127.0.0.1:1",
          ANTHROPIC_POOL: JSON.stringify([{ name: "acctA", token: "sk-ant-oat-fake-a" }, { name: "acctB", token: "sk-ant-oat-fake-b" }]) },
   stdio: "ignore",
@@ -124,10 +124,16 @@ check("bad password is 401", curl(["-o", "/dev/null", "-X", "POST", `${BASE}/api
 check("unknown admin endpoint is 404", api("nope").error, "unknown admin endpoint");
 
 console.log("shell routes:");
-check("root serves the panel", status("/"), "200");
-check("a UI slug serves the panel", status("/routing"), "200");
-check("a consolidated slug serves the panel", status("/identity"), "200");
-check("a legacy slug still serves the panel (client-side redirect)", status("/accounts"), "200");
+// The panel is a Next static export (panel/out) built separately (`npm run build:panel`); the image
+// builds it in stage 1. If it isn't built locally, skip these rather than fail the router suite.
+if (existsSync(join(ROOT, "panel/out/index.html"))) {
+  check("root serves the panel", status("/"), "200");
+  check("a UI slug serves the panel", status("/routing"), "200");
+  check("a consolidated slug serves the panel", status("/identity"), "200");
+  check("a legacy slug still serves the panel (client-side redirect)", status("/accounts"), "200");
+} else {
+  console.log("  skip  panel/out not built — run `npm run build:panel` to exercise shell routes");
+}
 // The /admin prefix is gone, not redirected. A tombstone 404 rather than a fall-through into the
 // model router, which would answer a stale POST /admin/api/login with "model_not_routable".
 check("/admin is gone", status("/admin"), "404");

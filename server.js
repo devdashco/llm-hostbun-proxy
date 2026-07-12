@@ -68,13 +68,20 @@ const PORT = parseInt(process.env.PORT || "80", 10);
 const DOCS_FILE = process.env.DOCS_FILE || "/srv/docs/index.html";
 // The docsify markdown and its vendored bundle sit beside the shell, in both dev and the container.
 const DOCS_DIR = nodePath.dirname(DOCS_FILE);
-const ADMIN_FILE = process.env.ADMIN_FILE || "/srv/admin/index.html";
 // Every refusal carries this. A 4xx that does not say where the answer lives just becomes a Slack
 // message to whoever wrote the router.
 const DOCS_URL = process.env.DOCS_URL || "https://docs.llm.hostbun.cc/";
-// The panel's modules live next to its shell, so a dev run (ADMIN_FILE=./admin/index.html) and the
-// container (/srv/admin/index.html) both resolve without a second env var to forget.
-const UI_DIR = nodePath.join(nodePath.dirname(ADMIN_FILE), "ui");
+// The Next.js panel is a STATIC EXPORT (panel/out), copied to /srv/panel in the image and served as
+// files — the router adds no runtime, stays pg-only. Root + each UI_ROUTE slug map onto the exported
+// `<slug>/index.html` (trailingSlash export); /_next/* and other assets are served by extension.
+const PANEL_DIR = process.env.PANEL_DIR || "/srv/panel";
+const PANEL_TYPES = {
+  ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8", ".json": "application/json; charset=utf-8",
+  ".txt": "text/plain; charset=utf-8", ".svg": "image/svg+xml", ".ico": "image/x-icon",
+  ".png": "image/png", ".webp": "image/webp", ".woff": "font/woff", ".woff2": "font/woff2",
+  ".map": "application/json; charset=utf-8",
+};
 
 // Config first: every module below reads CFG, and the key index must exist before the first request.
 loadConfig();
@@ -118,23 +125,29 @@ const server = http.createServer(async (req, res) => {
         message: "the /admin prefix was removed; the panel is at / and its JSON API at /api/*",
       } }));
     }
-    // The panel's own ES modules and stylesheet. Served from a fixed directory beside ADMIN_FILE,
-    // and the path is REJECTED unless it matches [a-z0-9-]+(/[a-z0-9-]+)?\.(js|css) — no "..", no
-    // absolute paths, no arbitrary reads off the container's filesystem.
-    if (req.method === "GET" && path.startsWith("/ui/")) {
-      const rel = path.slice(4);
-      if (!/^[a-z0-9-]+(\/[a-z0-9-]+)?\.(js|css)$/.test(rel)) {
+    // The Next export's assets: /_next/*, favicon.ico, *.svg, *.txt (RSC payloads), etc. Anything
+    // with a file extension is served from PANEL_DIR by type. Guarded against traversal: the resolved
+    // path must stay inside PANEL_DIR (kills "..", encoded or not). _next/static is content-hashed so
+    // it caches hard; everything else revalidates.
+    if (req.method === "GET" && /\.[a-z0-9]+$/i.test(path) && !path.includes("..")) {
+      const abs = nodePath.normalize(nodePath.join(PANEL_DIR, decodeURIComponent(path)));
+      if (!abs.startsWith(PANEL_DIR + nodePath.sep)) {
         res.writeHead(404, { "content-type": "text/plain" });
         return res.end("not found");
       }
-      const type = rel.endsWith(".css") ? "text/css; charset=utf-8" : "text/javascript; charset=utf-8";
-      return sendFile(res, nodePath.join(UI_DIR, rel), type, false, "no-cache");
+      const type = PANEL_TYPES[nodePath.extname(abs).toLowerCase()] || "application/octet-stream";
+      const cache = path.startsWith("/_next/static/") ? "public, max-age=31536000, immutable" : "no-cache";
+      return sendFile(res, abs, type, false, cache);
     }
-    // The SPA pushes /calls, /accounts, … so those must serve the shell on a hard refresh.
-    // Enumerated, never a catch-all: a catch-all at the root would shadow /v1/*, /local/*, and
-    // every future inference path, turning a routing bug into "the model endpoint returns HTML".
-    if (req.method === "GET" && (path === "/" || UI_ROUTES.has(path.replace(/\/$/, ""))))
-      return sendFile(res, ADMIN_FILE, "text/html; charset=utf-8", false, "no-cache");
+    // The SPA pushes /calls, /identity, … so those must serve the exported shell on a hard refresh.
+    // Enumerated (UI_ROUTES), never a catch-all: a catch-all at the root would shadow /v1/*, /local/*,
+    // and every future inference path, turning a routing bug into "the model endpoint returns HTML".
+    // trailingSlash export puts each route at `<slug>/index.html`; root is `index.html`.
+    if (req.method === "GET" && (path === "/" || UI_ROUTES.has(path.replace(/\/$/, "")))) {
+      const slug = path.replace(/^\/+|\/+$/g, "");
+      const file = slug ? nodePath.join(PANEL_DIR, slug, "index.html") : nodePath.join(PANEL_DIR, "index.html");
+      return sendFile(res, file, "text/html; charset=utf-8", false, "no-cache");
+    }
   }
 
   // Docs. A docsify site: one shell plus markdown, both served out of DOCS_DIR. It is reachable two

@@ -1,0 +1,25 @@
+#!/bin/sh
+# Refuse to push code the container cannot even require().
+#
+# 2026-07-12: matchProjectGroup was deleted from src/routing.js but left in its
+# module.exports. Node threw a ReferenceError at require time, so the process died
+# before binding a port. Coolify restarted it 11 times, hit the 10-restart ceiling,
+# gave up, and removed the container -- which took its Traefik router with it.
+# Result: 503 on :80 and a bare TLS internal_error on :443, for hours, over one
+# dangling identifier. test/imports.test.mjs finds it in 0.14s. It just never ran.
+#
+# Bypass (only if you know exactly why): git push --no-verify
+
+echo "pre-push: checking the module graph loads..."
+
+if ! npm run --silent test:imports; then
+  echo ""
+  echo "  PUSH BLOCKED -- the module graph does not load."
+  echo "  This code would crash-loop the container on deploy."
+  echo "  Fix it, or bypass with: git push --no-verify"
+  echo ""
+  exit 1
+fi
+
+echo "pre-push: module graph OK"
+exit 0
