@@ -50,7 +50,11 @@ AWS_KEY      = os.environ.get("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET   = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
 AWS_REGION   = os.environ.get("AWS_REGION", "eu-west-1")
 GPU_PCT      = float(os.environ.get("GPU_PCT", "90"))
-RL_PCT       = float(os.environ.get("RL_PCT", "92"))
+# RL_PCT >= 100 disables the "usage window approaching full" heads-up entirely. A Max account
+# riding at 90%+ (status 'allowed_warning') is HEALTHY and still serving — paging on it is noise,
+# not a throttle. Only a real router429 back-pressure or a genuinely-rejecting account status
+# (spent / OAuth-disabled) is a true LLM throttle. Default: off. Set e.g. RL_PCT=97 to opt back in.
+RL_PCT       = float(os.environ.get("RL_PCT", "101"))
 REMIND_MIN   = float(os.environ.get("REMIND_MIN", "60"))
 IMAGE_RE     = re.compile(os.environ.get("IMAGE_CONTAINER_RE", r"sd-turbo|imagegen|diffus"), re.I)
 STATE_FILE   = os.environ.get("STATE_FILE", os.path.expanduser("~/.llm-throttle-watch.state.json"))
@@ -304,8 +308,11 @@ def save_state(s):
 def main():
     conds = {}
     check_router(conds)
-    check_gpu(conds)
-    check_containers(conds)
+    # Host checks (GPU / container crash-loops / OOM) are OPT-IN and OFF by default — this watcher
+    # is about the LLM router, not pbox housekeeping. Set WATCH_HOST=1 to re-enable them.
+    if os.environ.get("WATCH_HOST") == "1":
+        check_gpu(conds)
+        check_containers(conds)
 
     now = time.time()
     prev = load_state()  # {condid: {"since": ts, "last_alert": ts, "msg": str}}
