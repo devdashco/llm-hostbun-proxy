@@ -317,6 +317,102 @@ def _kc_read() -> dict:
         return {}
 
 
+def _kc_write(blob: dict) -> bool:
+    """Write the credential blob back — macOS keychain (-U upserts), else the file."""
+    raw = json.dumps(blob)
+    if _IS_MAC:
+        try:
+            r = subprocess.run(["security", "add-generic-password", "-U", "-s", KC_SVC,
+                                "-a", KC_ACCT, "-w", raw], capture_output=True, timeout=10)
+            return r.returncode == 0
+        except Exception:
+            return False
+    try:
+        os.makedirs(os.path.dirname(CRED_FILE), exist_ok=True)
+        tmp = CRED_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(raw)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, CRED_FILE)
+        return True
+    except Exception:
+        return False
+
+
+def _direct_token(name: str) -> str:
+    """The account's LOCAL setup-token (~/.claude-accounts/<name>.token) — the only
+    way to go direct, since the router never reveals its server-side tokens."""
+    try:
+        t = open(os.path.expanduser(f"~/.claude-accounts/{name}.token")).read().strip()
+        return t if t.startswith("sk-ant-oat") else ""
+    except OSError:
+        return ""
+
+
+def _set_force_direct(on: bool) -> None:
+    """Flip the deliberate direct-connect flag + blank the route cache so the very
+    next shell re-decides. Shared by the Setup toggle and the account switches."""
+    if on:
+        os.makedirs(os.path.dirname(_FORCE_DIRECT_FLAG), exist_ok=True)
+        open(_FORCE_DIRECT_FLAG, "w").close()
+    else:
+        try:
+            os.remove(_FORCE_DIRECT_FLAG)
+        except FileNotFoundError:
+            pass
+    try:
+        os.remove(_ROUTE_MARKER)
+    except FileNotFoundError:
+        pass
+
+
+def switch_direct_local(name: str) -> dict:
+    """Switch DIRECT: put `name`'s local setup-token into the live login (keychain /
+    creds file) and set force-direct, so new panes hit api.anthropic.com as `name`.
+    Backs the old blob up to ~/.claude-accounts/.keychain-backup-<ts>.json first.
+    Returns {ok, error?}."""
+    tok = _direct_token(name)
+    if not tok:
+        return {"ok": False, "error": f"no local token — drop a setup-token in "
+                                      f"~/.claude-accounts/{name}.token (router tokens are server-side)"}
+    # cheap liveness probe before installing the login: 401 = revoked token
+    # (a stale .token file), anything else (403 scope-limited / 200) = alive.
+    try:
+        req = urllib.request.Request("https://api.anthropic.com/api/oauth/profile",
+                                     headers={"authorization": f"Bearer {tok}",
+                                              "anthropic-beta": "oauth-2025-04-20"})
+        urllib.request.urlopen(req, timeout=8).read(0)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return {"ok": False, "error": f"{name}'s local token is REVOKED — mint a fresh "
+                                          f"setup-token into ~/.claude-accounts/{name}.token"}
+    except Exception:
+        pass                                   # network hiccup → don't block the switch
+    blob = _kc_read()
+    try:
+        bak = os.path.expanduser(f"~/.claude-accounts/.keychain-backup-{int(time.time())}.json")
+        with open(bak, "w") as f:
+            json.dump(blob, f)
+        os.chmod(bak, 0o600)
+    except OSError:
+        pass
+    old = blob.get("claudeAiOauth") or {}
+    blob["claudeAiOauth"] = {
+        "accessToken": tok,
+        # setup-tokens are long-lived and have no refresh flow — far-future expiry
+        # so claude never tries to refresh.
+        "expiresAt": int((time.time() + 365 * 86400) * 1000),
+        "scopes": old.get("scopes") or ["user:inference", "user:profile"],
+        "subscriptionType": old.get("subscriptionType") or "max",
+    }
+    if not _kc_write(blob):
+        return {"ok": False, "error": "could not write the login (keychain/creds file)"}
+    _set_force_direct(True)
+    _write_local_selected(name)
+    _refresh_statusline_account()
+    return {"ok": True}
+
+
 # claudectl MCP server — holds the cross-machine fleet presence registry (which
 # box is on which account, each box's statusline verifies + publishes its own).
 MCP_BASE = os.environ.get("CLAUDECTL_MCP", "https://claudectl.hostbun.cc").rstrip("/")
@@ -954,10 +1050,14 @@ def _menu(stdscr, title, items):
 
 # per-account menu, opened with ↵ on a highlighted account row (Accounts tab)
 _ACCOUNT_ITEMS = [
-    ("switch to this account", "switch",
+    ("switch — via router (llm.hostbun.cc)", "switch",
      "Pin THIS box to this account in the router's server-side pin map "
-     "(/api/pins — merges one key, validates the name). Every pane routing "
-     "through llm.hostbun.cc bills to it LIVE; no restart needed."),
+     "(/api/pins). Every pane routing through llm.hostbun.cc bills to it LIVE; "
+     "no restart. Also turns force-direct OFF so the pin actually applies."),
+    ("switch — DIRECT (bypass router)", "switch_direct",
+     "Put this account's LOCAL setup-token (~/.claude-accounts/<name>.token) into "
+     "the login and force direct-connect: new panes hit api.anthropic.com as this "
+     "account. Needs the local token file — router tokens are never revealed."),
     ("test account (live)", "test",
      "Ask the router to ping this subscription once (1 token) and report the "
      "fresh 5h/7d reading — or the exact refusal (429 spent window vs "
@@ -1226,12 +1326,26 @@ def run(stdscr):
             busy(f"pinning {name} on the router · all panes, live…")
             gl = gateway_set_lock(name)
             if gl.get("ok"):
+                was_direct = os.path.exists(_FORCE_DIRECT_FLAG)
+                _set_force_direct(False)         # a pin only bites when routing via gateway
                 _write_local_selected(name)      # ★ tracks the pin
                 set_consumer_headers(name)       # keep X-Consumer/X-Project fresh
-                ok(f"now on {name}  ·  router ✓ live on every gateway pane — no restart")
+                ok(f"now on {name} via router ✓ live on every gateway pane"
+                   + (" · direct-connect turned OFF (new panes route via gateway)"
+                      if was_direct else " — no restart"))
             else:
                 err(f"pin FAILED: {gl.get('error','?')}  (is the box routing through "
                     f"the gateway? Setup tab → gateway on)")
+            data = fetch()
+        elif action == "switch_direct" and cur:
+            name = cur["name"]
+            busy(f"switching login to {name} + forcing direct-connect…")
+            r = switch_direct_local(name)
+            if r.get("ok"):
+                ok(f"now on {name} DIRECT · login swapped, router bypassed — open a "
+                   f"new pane (running panes keep their launch env)")
+            else:
+                err(f"direct switch failed: {r.get('error','?')}")
             data = fetch()
         elif action == "test" and cur:
             # THE live read: the router pings this one subscription (1 token) and
@@ -1313,18 +1427,11 @@ def run(stdscr):
             _run_external(stdscr, ["python3", _PANES_SCRIPT])
             stdscr.timeout(REFRESH_MS)
         elif action == "toggle_direct":
-            flag = os.path.expanduser("~/.claude-accounts/.cccc-force-direct")
-            route = os.path.expanduser("~/.claude/.cctl-route")
-            if os.path.exists(flag):
-                os.remove(flag)
-                try:                                  # blank the cache so next shell re-probes now
-                    os.remove(route)
-                except FileNotFoundError:
-                    pass
+            if os.path.exists(_FORCE_DIRECT_FLAG):
+                _set_force_direct(False)
                 ok("route: GATEWAY — direct-connect off · new panes route through llm.hostbun.cc")
             else:
-                os.makedirs(os.path.dirname(flag), exist_ok=True)
-                open(flag, "w").close()
+                _set_force_direct(True)
                 ok("route: DIRECT — bypassing router · new panes hit api.anthropic.com "
                    "(open a new pane / re-source rc for running ones)")
         elif action == "sync":
