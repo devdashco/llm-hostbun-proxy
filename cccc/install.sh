@@ -47,7 +47,7 @@ fi
 
 # --- 2. install the `cccc` command + its subcommands -----------------------
 mkdir -p "$PREFIX"
-chmod +x "$DIR/tui/claudectl_tui.py" "$DIR/tui/cccc_menu.py" "$DIR/tui/cccc_sync.py" "$DIR/tui/cccc_gateway.py" "$DIR/tui/panes_tui.py" "$DIR/tui/panes_gum.sh" \
+chmod +x "$DIR/tui/claudectl_tui.py" "$DIR/tui/claudectl_app.py" "$DIR/tui/cccc_menu.py" "$DIR/tui/cccc_sync.py" "$DIR/tui/cccc_gateway.py" "$DIR/tui/panes_tui.py" "$DIR/tui/panes_gum.sh" \
   "$DIR/plugins/claudectl/mcp/ccc_refresh.py" "$DIR/plugins/claudectl/mcp/ccc_doctor.py" \
   "$DIR/plugins/claudectl/mcp/ccc_terminals_mcp.py" "$DIR/plugins/claudectl/mcp/ccc_restart_mcp.py"
 command -v gum >/dev/null 2>&1 || say "tip: 'brew install gum' for the glam \`cccc panes\` picker (curses fallback works without it)"

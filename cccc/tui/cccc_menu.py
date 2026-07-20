@@ -27,7 +27,7 @@ from textual.binding import Binding
 from textual.widgets import Footer, Header, Label, ListItem, ListView
 
 _HERE = Path(__file__).resolve().parent
-CLAUDECTL = str(_HERE / "claudectl_tui.py")
+CLAUDECTL = str(_HERE / "claudectl_app.py")   # Textual version (curses = claudectl_tui.py)
 LOCALTOOLS = shutil.which("localtools") or str(Path.home() / ".local/bin/localtools")
 
 _ALL = [
