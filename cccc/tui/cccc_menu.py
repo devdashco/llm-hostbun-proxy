@@ -30,12 +30,16 @@ _HERE = Path(__file__).resolve().parent
 CLAUDECTL = str(_HERE / "claudectl_tui.py")
 LOCALTOOLS = shutil.which("localtools") or str(Path.home() / ".local/bin/localtools")
 
-OPTIONS = [
+_ALL = [
     ("claudectl", "claudectl — Claude account switcher",
-     "Pin/switch which Claude Max account this box uses; live 5h/7d limits, windows, plugins."),
+     "Pin/switch which Claude Max account this box uses; live 5h/7d limits, windows, plugins.",
+     lambda: Path(CLAUDECTL).exists()),
     ("localtools", "localtools — dev tools",
-     "GitHub issues → fix with Claude, caveman CLAUDE.md compressor, MCP tool-doc shrink."),
+     "GitHub issues → fix with Claude, caveman CLAUDE.md compressor, MCP tool-doc shrink.",
+     lambda: bool(shutil.which("localtools")) or Path(LOCALTOOLS).exists()),
 ]
+# only offer tools that actually exist on this box (localtools isn't on servers)
+OPTIONS = [(k, n, d) for k, n, d, avail in _ALL if avail()]
 
 
 class Chooser(App):
@@ -61,12 +65,22 @@ class Chooser(App):
         self.exit(event.item.id)
 
 
-def main() -> None:
-    choice = Chooser().run()
+def _launch(choice: str) -> None:
     if choice == "claudectl":
         os.execvp("python3", ["python3", CLAUDECTL, *sys.argv[1:]])
     elif choice == "localtools":
         os.execvp(LOCALTOOLS, [LOCALTOOLS])
+
+
+def main() -> None:
+    if len(OPTIONS) <= 1:
+        # only one tool on this box (e.g. servers have no localtools) → skip the menu
+        if OPTIONS:
+            _launch(OPTIONS[0][0])
+        return
+    choice = Chooser().run()
+    if choice:
+        _launch(choice)
     # else: user quit — do nothing
 
 
