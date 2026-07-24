@@ -144,6 +144,8 @@ export function Accounts() {
   const [fresh, setFresh] = useState<Record<string, any>>({});
   const [busy, setBusy] = useState("");
   const [confirmRm, setConfirmRm] = useState("");
+  const [newName, setNewName] = useState("");
+  const [newToken, setNewToken] = useState("");
   const load = useCallback(async () => {
     try {
       const r: any = await api("accounts");
@@ -175,6 +177,24 @@ export function Accounts() {
       setFresh(m);
       const nr = list.filter((x: any) => !x.reading).length;
       notify(`live limits: ${list.length - nr}/${list.length} read` + (nr ? ` · ${nr} no reading` : ""), nr > 0 && nr === list.length);
+      load();
+    } catch (e: any) {
+      notify(e.message, true);
+    } finally {
+      setBusy("");
+    }
+  }
+  async function addAccount() {
+    const name = newName.trim();
+    const token = newToken.replace(/\s+/g, ""); // paste often line-wraps the token; it has no spaces
+    if (!name) return notify("account name required", true);
+    if (!/^sk-ant-oat/.test(token)) return notify("expected a Max setup-token (sk-ant-oat…)", true);
+    setBusy("__add");
+    try {
+      const r: any = await api("accounts/token", { method: "POST", body: JSON.stringify({ account: name, token }) });
+      notify(r.created ? `added ${r.account}` : `rotated token for ${r.account}`);
+      setNewName("");
+      setNewToken("");
       load();
     } catch (e: any) {
       notify(e.message, true);
@@ -415,6 +435,32 @@ export function Accounts() {
                 ) : null}
               </TableBody>
             </Table>
+          </div>
+          <div className="mt-4 border-t pt-4">
+            <p className="mb-2 text-[12.5px] text-muted-foreground">
+              <b>Add a Max subscription.</b> Paste its setup-token (<span className="font-mono">sk-ant-oat…</span>) — same field rotates an
+              existing account&apos;s token if the name matches. This token is the <b>only copy</b>; it lands in{" "}
+              <span className="font-mono">/data/config.json</span> and is never shown again.
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <Input
+                className="min-w-[150px] flex-1"
+                placeholder="account name, e.g. kontaktEmphyx"
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+              />
+              <Input
+                className="min-w-[240px] flex-[2] font-mono"
+                type="password"
+                placeholder="sk-ant-oat01-…"
+                value={newToken}
+                onChange={(e) => setNewToken(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && addAccount()}
+              />
+              <Button disabled={!!busy} onClick={addAccount}>
+                {busy === "__add" ? "Adding…" : "Add account"}
+              </Button>
+            </div>
           </div>
         </CardContent>
       </Card>

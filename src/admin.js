@@ -449,13 +449,17 @@ async function handleAdminApi(req, res, path, prefix = "/api/") {
     if (!/^sk-ant-oat/.test(token)) return sendJson(res, 400, { error: "expected a Max setup-token (sk-ant-oat…)" });
     const pool = [...(CFG.claudecodeAccountPool || [])];
     const i = pool.findIndex((a) => String(a.name).toLowerCase() === name.toLowerCase());
-    if (i < 0) return sendJson(res, 400, { error: `unknown account '${name}'`, accounts: pool.map((a) => a.name) });
-    pool[i] = { ...pool[i], token };
+    // Create-if-absent: this is the ONLY add path (there is no separate accounts/add), which is why
+    // the MCP tool and the panel both call it "Import or rotate". A new entry is minimal {name,org,token};
+    // org is learned later from the anthropic-organization-id header on the first catalog sweep.
+    const created = i < 0;
+    if (created) pool.push({ name, org: "", token });
+    else pool[i] = { ...pool[i], token };
     CFG.claudecodeAccountPool = pool;
     CFG.anthropicPool = pool;   // legacy name, kept in sync so a rollback still boots
     const persisted = persistConfig();
-    console.warn(`[admin] token rotated for account=${pool[i].name} ip=${ip} persisted=${persisted}`);
-    return sendJson(res, 200, { ok: true, persisted, account: pool[i].name });
+    console.warn(`[admin] account ${created ? "ADDED" : "token rotated"} name=${name} ip=${ip} persisted=${persisted}`);
+    return sendJson(res, 200, { ok: true, persisted, account: name, created });
   }
 
   // Remove ONE account from the pool, credential and all. Filters by name server-side so every other
