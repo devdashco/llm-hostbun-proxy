@@ -12,6 +12,15 @@ stages:
 default:
   image: node:24-alpine
   interruptible: true
+  # Retry only on INFRASTRUCTURE failures (flaky image pull / containerd hiccup / stuck runner) — a
+  # real script/test failure still fails immediately, so this never masks a genuine regression.
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - scheduler_failure
+      - unknown_failure
   # No runner tag is set, so any available fleet runner picks these up. If the fleet's runners are
   # tag-gated and jobs sit "pending", add the runner's tag(s) under a `tags:` key here.
 
